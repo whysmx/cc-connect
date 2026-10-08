@@ -127,10 +127,14 @@ jobs:
 
       - name: Enforce WeCom coverage threshold
         run: |
-          go test ./platform/wecomkf ./platform/wecom_kf -coverprofile=wecom.cover -covermode=atomic
-          total="$(go tool cover -func=wecom.cover | awk '/total:/ {gsub("%","",$3); print $3}')"
-          echo "WeCom package coverage: ${total}%"
-          awk -v total="${total}" 'BEGIN { if (total + 0 < 95) { exit 1 } }'
+          for pkg in ./platform/wecomkf ./platform/wecom_kf; do
+            name="$(basename "$pkg")"
+            profile="coverage-$name.out"
+            go test "$pkg" -coverprofile="$profile" -covermode=atomic
+            total="$(go tool cover -func="$profile" | awk '/total:/ {gsub("%","",$3); print $3}')"
+            echo "$pkg coverage: ${total}%"
+            awk -v total="${total}" 'BEGIN { if (total + 0 < 95) { exit 1 } }'
+          done
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
