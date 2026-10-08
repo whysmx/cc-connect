@@ -41,8 +41,27 @@ type SyncMessageResponse struct {
 	ErrCode    int           `json:"errcode"`
 	ErrMsg     string        `json:"errmsg"`
 	NextCursor string        `json:"next_cursor"`
-	HasMore    bool          `json:"has_more"`
+	HasMore    BoolInt       `json:"has_more"`
 	MsgList    []SyncMessage  `json:"msg_list"`
+}
+
+type BoolInt bool
+
+func (b *BoolInt) UnmarshalJSON(data []byte) error {
+	if string(data) == "true" {
+		*b = true
+		return nil
+	}
+	if string(data) == "false" {
+		*b = false
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(data, &n); err != nil {
+		return fmt.Errorf("wecomkf: invalid boolean/integer flag %q: %w", string(data), err)
+	}
+	*b = n != 0
+	return nil
 }
 
 type SyncMessage struct {
