@@ -1,6 +1,6 @@
 # 微信客服（WeChat Customer Service）接入 / `wecom_kf`
 
-> 状态：P2 单客服 + P3 多客服 + P4 人工接管抑制 已实现代码与自动化测试，**尚待真实企业微信账号联调**。
+> 状态：P2 单客服 + P3 多客服 + P4 人工接管抑制 + 入站图片/语音/视频/文件 已实现代码与自动化测试，**尚待真实企业微信账号联调**。
 > 总体规划见 [wecom-kf-codex-development-plan.md](./wecom-kf-codex-development-plan.md)。
 
 `wecom_kf` 平台让个人微信用户通过企业微信「微信客服」向 cc-connect 项目（例如 Codex）提问，并把回答发回微信。
@@ -24,7 +24,8 @@
 - **人工接管**：会话状态为「待接入池排队中(2)」「由人工接待(3)」或「已结束(4)」时，新问题不交给 AI；AI 已在生成时，回复前再次检查，若已转人工则丢弃迟到回答。人工结束后的恢复遵循微信客服平台自身的状态流转（客户再次发消息后状态变为「未处理」），本平台不强制改变状态。`service_state/get` 调用失败时会记录告警并继续（fail-open），可设 `takeover_check = false` 关闭检查。
 - **发送限制**：微信客服规定每条客户消息后最多可回复 5 条（48 小时内）。平台为每个客户维护发送额度（`max_replies_per_message`，默认 5），超出时截断并标注 `…`。建议项目设置 `quiet = true`，避免思考/工具进度消息消耗额度。
 - **格式**：微信只显示纯文本，回复前会去除 Markdown，并通过 `FormattingInstructions` 提示 Agent 使用纯文本、只读问答。
-- **消息类型**：目前仅处理客户发送的文本消息；客服人员回复（origin=5）与系统事件（origin=4）不会再次触发机器人。图片、语音、文件等暂不处理（记录日志）。
+- **消息类型**：处理客户发送的文本、图片、语音、视频、文件。媒体通过 `media/get` 下载（单个上限 25 MB；微信客服本身限制图片/语音 2 MB、视频 10 MB、文件 20 MB），图片作为图片附件、语音作为 AMR 音频（配置了 `[speech]` 时由引擎转文字）、视频和文件作为文件附件交给 Agent，文件名取自下载响应的 `Content-Disposition`。附件由 cc-connect 按现有机制保存到项目工作目录下的 `.cc-connect/attachments/`（Codex 本身仍是只读）。位置、链接、小程序等其他类型以及发送失败的下载会记录日志后忽略。客服人员回复（origin=5）与系统事件（origin=4）不会再次触发机器人。可设 `inbound_media = false` 只接收文本。
+- **消息合并**：与企业微信 WebSocket 私聊的聚合方式一致，同一客户在 `merge_window_ms`（默认 2000 ms）内连续发送的消息会合并成一次提问（例如先发文件再问“这个文件讲了什么”），媒体下载未完成时会等待下载结束再发出；设为 0 关闭合并。回复只发送文本，不发送媒体。
 
 ## 企业微信后台配置
 
@@ -97,6 +98,8 @@ callback_path = "/wecom-kf/callback"
 | `callback_path` | 否 | `/wecom-kf/callback` | 回调路径 |
 | `takeover_check` | 否 | `true` | 分发和回复前查询会话状态 |
 | `max_replies_per_message` | 否 | `5` | 每条客户消息后最多发送条数 |
+| `inbound_media` | 否 | `true` | 接收客户图片 / 语音 / 视频 / 文件 |
+| `merge_window_ms` | 否 | `2000` | 合并同一客户连续消息的时间窗（毫秒），0 关闭 |
 | `allow_from` | 否 | 全部 | 允许的客户 `external_userid`，逗号分隔 |
 | `api_base_url` | 否 | `https://qyapi.weixin.qq.com` | API 地址覆盖 |
 | `proxy` | 否 | | API 出站正向代理 |
@@ -108,7 +111,7 @@ callback_path = "/wecom-kf/callback"
 - 回调验签/解密、`sync_msg` token 与频率、`send_msg` 的 48 小时窗口和 5 条限制在真实账号上的表现。
 - 人工结束会话后 AI 恢复接待的实际状态流转。
 - 是否需要在 AI 接待时主动把会话转为「由智能助手接待(1)」。
-- 图片/文件等多媒体、欢迎语（`enter_session` + `welcome_code`）。
+- 真实账号下 `media/get` 对微信客服媒体的返回头（文件名、类型）与大小限制；欢迎语（`enter_session` + `welcome_code`）。
 - Windows 服务化部署与只读沙箱在 Windows 上的实际效果（规划 P1/P4）。
 
 ---
@@ -121,5 +124,7 @@ and notifications are routed by `open_kfid`. Messages are pulled with `kf/sync_m
 under `<data_dir>/wecom_kf/`), dispatched with session key `wecom_kf:{corp_id}:{open_kfid}:{external_userid}`, and
 answered as plain text via `kf/send_msg` (split at 2048 bytes, at most `max_replies_per_message` sends per customer
 message). When a session is queued for or handled by a human servicer, the AI neither receives the question nor sends
-late answers. Use the Codex agent with `mode = "suggest"` for read-only Q&A. Only customer text messages are handled
-for now; real-account integration testing is still pending.
+late answers. Use the Codex agent with `mode = "suggest"` for read-only Q&A. Customer text, images, voice (AMR),
+video and files are passed to the agent (media via `media/get`, `inbound_media = false` for text only); messages a
+customer sends within `merge_window_ms` (default 2 s) are merged into one turn. Replies are text only. Real-account
+integration testing is still pending.

@@ -1561,6 +1561,9 @@ app_secret = "your-feishu-app-secret"
 # callback_path = "/wecom-kf/callback"      # default / 默认值
 # takeover_check = true                     # check service_state before dispatch and reply / 分发与回复前检查会话状态
 # max_replies_per_message = 5               # WeChat KF send limit per customer message / 每条客户消息最多发送条数
+# inbound_media = true                      # pass customer images / voice / video / files to the agent / 把客户图片、语音、视频、文件交给 Agent
+# merge_window_ms = 2000                    # merge a customer's messages sent within this window (e.g. file + question); 0 = off
+#                                           # 合并同一客户在该时间窗内连续发送的消息（如先发文件再提问）；0 关闭
 # allow_from = "*"                          # allowed external_userid list / 允许的客户 external_userid
 # api_base_url = "https://qyapi.weixin.qq.com"  # optional / 可选
 # proxy = ""                                # optional forward proxy for API calls / 可选正向代理
