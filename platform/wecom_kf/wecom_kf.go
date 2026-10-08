@@ -2,7 +2,6 @@ package wecom_kf
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
