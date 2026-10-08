@@ -12,6 +12,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+
+	"github.com/chenhg5/cc-connect/platform/wecomkf"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -293,4 +296,89 @@ func TestCoverageDuplicateEmptyAndExpiry(t *testing.T) {
 	if p.duplicate("fresh") { t.Fatal("fresh id should not duplicate") }
 	if _, ok := p.seen["old"]; ok { t.Fatal("expired id was not evicted") }
 	if !p.duplicate("fresh") { t.Fatal("fresh id should duplicate on second observation") }
+}
+
+
+func TestPullSyncFailurePreservesCursor(t *testing.T) {
+	requests := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/cgi-bin/kf/sync_msg" {
+			t.Errorf("unexpected request path %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"errcode":95001,"errmsg":"sync rejected"}`))
+	}))
+	defer api.Close()
+	p0, err := New(testOptions(api.URL))
+	if err != nil { t.Fatal(err) }
+	p := p0.(*Platform)
+	p.token.value, p.token.expiresAt = "cached", time.Now().Add(time.Hour)
+	p.cursor = "last-success"
+	delivered := 0
+	p.handler = func(_ core.Platform, _ *core.Message) { delivered++ }
+	p.pullMessages("pull", "wk1")
+	if requests != 1 || delivered != 0 || p.cursor != "last-success" {
+		t.Fatalf("failed sync changed progress: requests=%d delivered=%d cursor=%q", requests, delivered, p.cursor)
+	}
+}
+
+func TestPullRejectsDisallowedUserAndAdvancesCursor(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"errcode":0,"next_cursor":"done","has_more":0,"msg_list":[{"msgid":"denied","open_kfid":"wk1","external_userid":"blocked","origin":3,"msgtype":"text","text":{"content":"do not deliver"}}]}`))
+	}))
+	defer api.Close()
+	opts := testOptions(api.URL)
+	opts["allow_from"] = "allowed"
+	p0, err := New(opts)
+	if err != nil { t.Fatal(err) }
+	p := p0.(*Platform)
+	p.token.value, p.token.expiresAt = "cached", time.Now().Add(time.Hour)
+	delivered := 0
+	p.handler = func(_ core.Platform, _ *core.Message) { delivered++ }
+	p.pullMessages("pull", "wk1")
+	if delivered != 0 || p.cursor != "done" {
+		t.Fatalf("allow-list failure: delivered=%d cursor=%q", delivered, p.cursor)
+	}
+}
+
+func TestReplySendFailureStopsRemainingChunks(t *testing.T) {
+	sends := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sends++
+		if r.URL.Path != "/cgi-bin/kf/send_msg" {
+			t.Errorf("unexpected request path %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"errcode":95018,"errmsg":"session state forbids sending"}`))
+	}))
+	defer api.Close()
+	p0, err := New(testOptions(api.URL))
+	if err != nil { t.Fatal(err) }
+	p := p0.(*Platform)
+	p.token.value, p.token.expiresAt = "cached", time.Now().Add(time.Hour)
+	err = p.Reply(context.Background(), replyContext{toUser: "u", openKfID: "wk1", msgID: "m"}, strings.Repeat("x", 4097))
+	var apiErr *wecomkf.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != 95018 || sends != 1 {
+		t.Fatalf("send failure not propagated/stopped: error=%v sends=%d", err, sends)
+	}
+}
+
+func TestTokenMalformedResponseIsNotCached(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not-json"))
+	}))
+	defer api.Close()
+	p0, err := New(testOptions(api.URL))
+	if err != nil { t.Fatal(err) }
+	p := p0.(*Platform)
+	token, err := p.accessToken(context.Background())
+	if err == nil || token != "" || p.token.value != "" {
+		t.Fatalf("malformed response cached: token=%q error=%v", token, err)
+	}
+}
+
+func TestRedactionSkipsEmptyAndRemovesEscapedSecrets(t *testing.T) {
+	got := redactSecrets("credential=a/b? and a%2Fb%3F", "", "a/b?")
+	if got != "credential=[REDACTED] and [REDACTED]" {
+		t.Fatalf("redaction failed: %q", got)
+	}
 }
