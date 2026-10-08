@@ -40,6 +40,8 @@ const (
 	// maxMediaBytes caps a single download. WeChat Customer Service itself
 	// limits media to 2 MB (image/voice), 10 MB (video) and 20 MB (file).
 	maxMediaBytes = 25 << 20
+	// welcomeCodeTTL is how long an enter_session welcome_code stays valid.
+	welcomeCodeTTL = 20 * time.Second
 )
 
 func init() {
@@ -54,18 +56,19 @@ type replyContext struct {
 
 // Platform is one WeChat Customer Service account bound to one project.
 type Platform struct {
-	project       string
-	corpID        string
-	openKfID      string
-	callbackToken string
-	aesKey        []byte
-	listenAddr    string
-	callbackPath  string
-	allowFrom     string
-	takeoverCheck bool
-	maxReplies    int
-	inboundMedia  bool
-	mergeWindow   time.Duration
+	project        string
+	corpID         string
+	openKfID       string
+	callbackToken  string
+	aesKey         []byte
+	listenAddr     string
+	callbackPath   string
+	allowFrom      string
+	takeoverCheck  bool
+	maxReplies     int
+	inboundMedia   bool
+	mergeWindow    time.Duration
+	welcomeMessage string
 	// skipBacklog is true when no cursor was persisted yet: the first pull
 	// returns up to 3 days of history, which must not be answered.
 	skipBacklog bool
@@ -146,6 +149,11 @@ func New(opts map[string]any) (core.Platform, error) {
 	if v, ok := opts["inbound_media"].(bool); ok {
 		inboundMedia = v
 	}
+	welcomeMessage := str("welcome_message")
+	if chunks := splitText(welcomeMessage, maxTextBytes); len(chunks) > 1 {
+		slog.Warn("wecom_kf: welcome_message longer than one WeChat message, truncating", "bytes", len(welcomeMessage))
+		welcomeMessage = chunks[0]
+	}
 	mergeWindow := defaultMergeWindow
 	if ms, ok := intOption(opts["merge_window_ms"]); ok {
 		if ms < 0 {
@@ -172,23 +180,24 @@ func New(opts map[string]any) (core.Platform, error) {
 	core.CheckAllowFrom(platformName, allowFrom)
 
 	return &Platform{
-		project:       project,
-		corpID:        corpID,
-		openKfID:      openKfID,
-		callbackToken: callbackToken,
-		aesKey:        aesKey,
-		listenAddr:    listenAddr,
-		callbackPath:  callbackPath,
-		allowFrom:     allowFrom,
-		takeoverCheck: takeoverCheck,
-		maxReplies:    maxReplies,
-		inboundMedia:  inboundMedia,
-		mergeWindow:   mergeWindow,
-		agg:           make(map[string]*aggregate),
-		api:           newAPIClient(apiBaseURL, corpID, corpSecret, httpClient),
-		store:         store,
-		skipBacklog:   store.Cursor() == "",
-		budget:        make(map[string]int),
+		project:        project,
+		corpID:         corpID,
+		openKfID:       openKfID,
+		callbackToken:  callbackToken,
+		aesKey:         aesKey,
+		listenAddr:     listenAddr,
+		callbackPath:   callbackPath,
+		allowFrom:      allowFrom,
+		takeoverCheck:  takeoverCheck,
+		maxReplies:     maxReplies,
+		inboundMedia:   inboundMedia,
+		mergeWindow:    mergeWindow,
+		welcomeMessage: welcomeMessage,
+		agg:            make(map[string]*aggregate),
+		api:            newAPIClient(apiBaseURL, corpID, corpSecret, httpClient),
+		store:          store,
+		skipBacklog:    store.Cursor() == "",
+		budget:         make(map[string]int),
 	}, nil
 }
 
@@ -344,6 +353,7 @@ func (p *Platform) processMessage(ctx context.Context, m *kfMessage) {
 	case originCustomer:
 	case originSystem:
 		p.logEvent(m)
+		p.maybeWelcome(ctx, m)
 		return
 	case originServicer:
 		// Human servicer replies (and anything not from the customer) must
@@ -510,6 +520,35 @@ func fallbackName(name, def string) string {
 	return name
 }
 
+// maybeWelcome answers an enter_session event with the configured welcome
+// message. WeChat only returns welcome_code when the customer has not been
+// welcomed or written in the last 48 hours, and the code expires after 20
+// seconds, so stale events (e.g. history pulled at first start) are skipped.
+func (p *Platform) maybeWelcome(ctx context.Context, m *kfMessage) {
+	ev := m.Event
+	if p.welcomeMessage == "" || ev == nil || ev.EventType != "enter_session" || ev.WelcomeCode == "" {
+		return
+	}
+	if ev.OpenKfID != "" && ev.OpenKfID != p.openKfID {
+		return
+	}
+	if m.SendTime > 0 && time.Since(time.Unix(m.SendTime, 0)) > welcomeCodeTTL {
+		slog.Info("wecom_kf: welcome_code expired, welcome message skipped", "external_userid", ev.ExternalUserID)
+		return
+	}
+	if !core.AllowList(p.allowFrom, ev.ExternalUserID) {
+		return
+	}
+	err := withRetry(ctx, "send_msg_on_event", func() error {
+		return p.api.sendOnEvent(ctx, ev.WelcomeCode, p.welcomeMessage)
+	})
+	if err != nil {
+		slog.Warn("wecom_kf: send welcome message failed", "external_userid", ev.ExternalUserID, "error", err)
+		return
+	}
+	slog.Info("wecom_kf: welcome message sent", "open_kfid", p.openKfID, "external_userid", ev.ExternalUserID, "scene", ev.Scene)
+}
+
 func (p *Platform) logEvent(m *kfMessage) {
 	if m.Event == nil {
 		return
@@ -623,13 +662,22 @@ func (p *Platform) takeBudget(externalUserID string, n int) int {
 }
 
 func (p *Platform) sendWithRetry(ctx context.Context, rc replyContext, text string) error {
+	return withRetry(ctx, "send_msg", func() error {
+		_, err := p.api.sendText(ctx, rc.openKfID, rc.externalUserID, text)
+		return err
+	})
+}
+
+// withRetry runs send up to sendAttempts times while it fails with a
+// retryable error.
+func withRetry(ctx context.Context, op string, send func() error) error {
 	var err error
 	for attempt := 1; attempt <= sendAttempts; attempt++ {
-		_, err = p.api.sendText(ctx, rc.openKfID, rc.externalUserID, text)
+		err = send()
 		if err == nil || !isRetryable(err) || attempt == sendAttempts {
 			break
 		}
-		slog.Warn("wecom_kf: send_msg failed, retrying", "attempt", attempt, "error", err)
+		slog.Warn("wecom_kf: send failed, retrying", "op", op, "attempt", attempt, "error", err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

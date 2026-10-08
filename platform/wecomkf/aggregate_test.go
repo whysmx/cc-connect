@@ -161,3 +161,27 @@ func TestNew_MergeWindowOption(t *testing.T) {
 		t.Fatalf("merge window = %v", p.(*Platform).mergeWindow)
 	}
 }
+
+func TestMerge_StaleTimerIsIgnored(t *testing.T) {
+	f := newFakeWeCom(t)
+	p, rec := newMergingPlatform(t, f, 60_000)
+	m := customerText("t", "wk1", "u", "current")
+	p.processMessage(p.ctx, &m)
+
+	// A timer belonging to an aggregate that was already flushed and
+	// replaced must not dispatch (or delete) the current one.
+	key := SessionKey("corp1", "wk1", "u")
+	p.flush(key, &aggregate{msg: &core.Message{Content: "stale"}})
+	rec.expectNone(t)
+	p.aggMu.Lock()
+	cur := p.agg[key]
+	p.aggMu.Unlock()
+	if cur == nil || cur.msg.Content != "current" {
+		t.Fatalf("current aggregate disturbed: %+v", cur)
+	}
+	// The real timer path still works.
+	p.flush(key, cur)
+	if got := rec.wait(t); got.Content != "current" {
+		t.Fatalf("got %+v", got)
+	}
+}

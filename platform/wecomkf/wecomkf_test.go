@@ -30,9 +30,14 @@ type fakeWeCom struct {
 	tokenCalls int
 	expireNext bool           // next API call answers 42001
 	fail       map[string]int // path -> errcode to return
+	welcomes   []welcomeMsg
 	media      map[string]fakeMedia
 	mediaGate  chan struct{} // when set, media/get blocks until it is closed
 	mediaCalls int
+}
+
+type welcomeMsg struct {
+	Code, Content string
 }
 
 type fakeMedia struct {
@@ -100,9 +105,25 @@ func (f *fakeWeCom) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(body, &req)
 		f.sent = append(f.sent, sentMsg{OpenKfID: req.OpenKfID, ToUser: req.ToUser, Content: req.Text.Content})
 		_ = json.NewEncoder(w).Encode(map[string]any{"errcode": 0, "msgid": "sent"})
+	case "/cgi-bin/kf/send_msg_on_event":
+		var req struct {
+			Code string `json:"code"`
+			Text struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		}
+		_ = json.Unmarshal(body, &req)
+		f.welcomes = append(f.welcomes, welcomeMsg{Code: req.Code, Content: req.Text.Content})
+		_ = json.NewEncoder(w).Encode(map[string]any{"errcode": 0, "msgid": "w"})
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (f *fakeWeCom) welcomeMessages() []welcomeMsg {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]welcomeMsg(nil), f.welcomes...)
 }
 
 func (f *fakeWeCom) serveMedia(w http.ResponseWriter, r *http.Request) {

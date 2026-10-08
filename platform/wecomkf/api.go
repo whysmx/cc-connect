@@ -89,6 +89,8 @@ type kfEvent struct {
 	NewServicer    string `json:"new_servicer_userid"`
 	FailMsgID      string `json:"fail_msgid"`
 	FailType       int    `json:"fail_type"`
+	Scene          string `json:"scene"`
+	WelcomeCode    string `json:"welcome_code"`
 }
 
 // kfMessage is one entry of kf/sync_msg msg_list.
@@ -295,6 +297,17 @@ func (c *apiClient) sendText(ctx context.Context, openKfID, externalUserID, cont
 		return "", err
 	}
 	return out.MsgID, nil
+}
+
+// sendOnEvent sends a text event-response message (welcome message) with
+// the code from an enter_session event.
+func (c *apiClient) sendOnEvent(ctx context.Context, code, content string) error {
+	var out sendMsgResponse
+	return c.postJSON(ctx, "send_msg_on_event", "/cgi-bin/kf/send_msg_on_event", map[string]any{
+		"code":    code,
+		"msgtype": "text",
+		"text":    map[string]string{"content": content},
+	}, &out)
 }
 
 // downloadedMedia is a temporary media file fetched with media/get.
