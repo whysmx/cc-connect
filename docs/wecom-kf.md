@@ -1,6 +1,6 @@
 # 微信客服（WeChat Customer Service）接入 / `wecom_kf`
 
-> 状态：P2 单客服 + P3 多客服 + P4 人工接管抑制 + 入站图片/语音/视频/文件 + 欢迎语 已实现代码与自动化测试，**尚待真实企业微信账号联调**。
+> 状态：P2 单客服 + P3 多客服 + P4 人工接管抑制 + 入站图片/语音/视频/文件 + 欢迎语 + Windows 服务化脚本 已实现代码与自动化测试，**尚待真实企业微信账号联调**。
 > 总体规划见 [wecom-kf-codex-development-plan.md](./wecom-kf-codex-development-plan.md)。
 
 `wecom_kf` 平台让个人微信用户通过企业微信「微信客服」向 cc-connect 项目（例如 Codex）提问，并把回答发回微信。
@@ -34,7 +34,8 @@
 2. 记录企业 `corp_id`、该应用的 `Secret`（填 `corp_secret`）、各客服账号的 `open_kfid`（`wk` 开头）。
 3. 在微信客服 API 的回调配置中填写：URL `https://<你的域名>/wecom-kf/callback`、Token、EncodingAESKey（43 位）。**先启动 cc-connect 再保存**，以通过 URL 校验。
 4. 服务器出口 IP 加入应用的企业可信 IP。
-5. 公网 HTTPS 反向代理只把 `/wecom-kf/callback` 转发到 `127.0.0.1:8081`，不要直接暴露 cc-connect 或 Codex 的其它端口。
+5. 公网 HTTPS 反向代理只把 `/wecom-kf/callback` 转发到 `127.0.0.1:8081`，不要直接暴露 cc-connect 或 Codex 的其它端口。`listen_addr` 不是回环地址时启动会告警。
+6. Windows 服务器部署（服务账户开机自启、日志轮转、只读权限、备份）见 [wecom-kf-windows.md](./wecom-kf-windows.md)；启动时对微信客服项目的 Codex 模式、`backend`、`admin_from` 做检查并告警。
 
 ## 配置示例
 
@@ -112,9 +113,9 @@ callback_path = "/wecom-kf/callback"
 
 - 回调验签/解密、`sync_msg` token 与频率、`send_msg` 的 48 小时窗口和 5 条限制在真实账号上的表现。
 - 人工结束会话后 AI 恢复接待的实际状态流转。
-- 是否需要在 AI 接待时主动把会话转为「由智能助手接待(1)」。
+- 是否需要在 AI 接待时主动改变会话状态（规划未要求，当前不改变）；人工接管是否需要 API 把会话转入接待池（状态 2，例如客户发送“转人工”）。
 - 真实账号下 `media/get` 对微信客服媒体的返回头（文件名、类型）与大小限制；欢迎语在真实账号下的触发条件与 `send_msg_on_event` 行为。
-- Windows 服务化部署与只读沙箱在 Windows 上的实际效果（规划 P1/P4）。
+- Windows 服务化部署（[wecom-kf-windows.md](./wecom-kf-windows.md)）与只读沙箱在 Windows 上的实际效果（规划 P1/P4）。
 
 ---
 
@@ -130,4 +131,7 @@ late answers. Use the Codex agent with `mode = "suggest"` for read-only Q&A. Cus
 video and files are passed to the agent (media via `media/get`, `inbound_media = false` for text only); messages a
 customer sends within `merge_window_ms` (default 2 s) are merged into one turn. An optional `welcome_message` is sent
 via `kf/send_msg_on_event` when a customer enters the chat with a fresh `welcome_code`. Replies are text only. Real-account
-integration testing is still pending.
+integration testing is still pending. Windows Server deployment (boot-time scheduled task under a service account,
+log rotation, read-only NTFS permissions, reverse proxy) is described in [wecom-kf-windows.md](./wecom-kf-windows.md);
+at startup cc-connect warns when a wecom_kf project uses a writable Codex mode, the `app_server` backend, a non-Codex agent,
+`admin_from = "*"`, or a non-loopback `listen_addr`.
