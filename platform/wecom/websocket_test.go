@@ -252,8 +252,48 @@ func TestHandleMsgCallback_SingleChat_ChatIDFallback(t *testing.T) {
 		if rc.chatID != "zhangsan" {
 			t.Fatalf("expected chatID to fall back to userID 'zhangsan', got %q", rc.chatID)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("handler not called")
+	}
+}
+
+func TestPrivateMessagesAggregateTextAndFile(t *testing.T) {
+	p, captured := newCapturedWSPlatform()
+	sessionKey := "wecom:zhangsan:zhangsan"
+
+	p.emitInbound("single", &core.Message{
+		SessionKey: sessionKey,
+		MessageID:  "text-1",
+		Content:    "analyze this file",
+		ReplyCtx:   wsReplyContext{chatID: "zhangsan", userID: "zhangsan"},
+	})
+	p.emitInbound("single", &core.Message{
+		SessionKey: sessionKey,
+		MessageID:  "file-1",
+		Files: []core.FileAttachment{{
+			FileName: "report.txt",
+			MimeType: "text/plain",
+			Data:     []byte("report"),
+		}},
+		ReplyCtx: wsReplyContext{chatID: "zhangsan", userID: "zhangsan"},
+	})
+
+	select {
+	case msg := <-captured:
+		if msg.Content != "analyze this file" {
+			t.Fatalf("Content = %q", msg.Content)
+		}
+		if len(msg.Files) != 1 || msg.Files[0].FileName != "report.txt" {
+			t.Fatalf("Files = %#v", msg.Files)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("aggregated handler not called")
+	}
+
+	select {
+	case msg := <-captured:
+		t.Fatalf("handler called more than once: %#v", msg)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -1094,5 +1134,50 @@ func TestNewWebSocket_ValidConfig(t *testing.T) {
 	ws := p.(*WSPlatform)
 	if ws.botID != "aibTest" || ws.secret != "secretXYZ" || ws.allowFrom != "user1,user2" {
 		t.Fatalf("unexpected config: botID=%s secret=%s allowFrom=%s", ws.botID, ws.secret, ws.allowFrom)
+	}
+}
+
+func TestNewWebSocket_DefaultWSEndpoint(t *testing.T) {
+	p, err := newWebSocket(map[string]any{
+		"bot_id":     "aibTest",
+		"bot_secret": "secretXYZ",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ws := p.(*WSPlatform)
+	if ws.wsURL != wsEndpoint {
+		t.Fatalf("expected default wsURL %q, got %q", wsEndpoint, ws.wsURL)
+	}
+}
+
+func TestNewWebSocket_CustomWSEndpoint(t *testing.T) {
+	const custom = "wss://corp.example.com:85/im_openws?bizid=1"
+	p, err := newWebSocket(map[string]any{
+		"bot_id":     "aibTest",
+		"bot_secret": "secretXYZ",
+		"ws_url":     custom,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ws := p.(*WSPlatform)
+	if ws.wsURL != custom {
+		t.Fatalf("expected custom wsURL %q, got %q", custom, ws.wsURL)
+	}
+}
+
+func TestNewWebSocket_BlankWSEndpointFallsBack(t *testing.T) {
+	p, err := newWebSocket(map[string]any{
+		"bot_id":     "aibTest",
+		"bot_secret": "secretXYZ",
+		"ws_url":     "   ",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ws := p.(*WSPlatform)
+	if ws.wsURL != wsEndpoint {
+		t.Fatalf("expected blank ws_url to fall back to %q, got %q", wsEndpoint, ws.wsURL)
 	}
 }

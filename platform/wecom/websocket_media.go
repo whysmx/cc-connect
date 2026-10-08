@@ -430,7 +430,7 @@ func (p *WSPlatform) deliverWSMediaInbound(body *wsMsgCallbackBody, sessionKey, 
 		return
 	}
 
-	p.handler(p, &core.Message{
+	p.emitInbound(body.ChatType, &core.Message{
 		SessionKey: sessionKey, Platform: "wecom",
 		MessageID: body.MsgID,
 		UserID:    body.From.UserID, UserName: body.From.UserID,
