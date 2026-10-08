@@ -191,6 +191,7 @@ callback_path = "/wecom-kf/callback"
 | P3 多客服 | 已实现：共享监听与回调路由、按 `open_kfid` 分发、重复映射/凭证冲突启动失败、游标与 msgid 持久化去重 |
 | P4 接管与部署 | 已实现：`service_state` 分发前/回复前检查、发送重试、access_token 自动刷新、每条客户消息 5 条发送额度；Windows 服务化与真实环境回归待做 |
 | 多媒体（4.1 复用） | 已实现：入站图片 / 语音 / 视频 / 文件经 `media/get` 下载后按 cc-connect 现有附件机制交给 Agent；同一客户连续消息按时间窗合并（与企业微信 WebSocket 私聊聚合一致）；回复仍为纯文本 |
+| 欢迎语 | 已实现：可选 `welcome_message`，`enter_session` 事件带 `welcome_code` 时经 `kf/send_msg_on_event` 发送；过期/重复事件跳过 |
 
 使用说明见 [wecom-kf.md](./wecom-kf.md)。
 

@@ -1564,6 +1564,8 @@ app_secret = "your-feishu-app-secret"
 # inbound_media = true                      # pass customer images / voice / video / files to the agent / 把客户图片、语音、视频、文件交给 Agent
 # merge_window_ms = 2000                    # merge a customer's messages sent within this window (e.g. file + question); 0 = off
 #                                           # 合并同一客户在该时间窗内连续发送的消息（如先发文件再提问）；0 关闭
+# welcome_message = ""                      # optional greeting sent when a customer opens the chat (enter_session + welcome_code); empty = off
+#                                           # 可选欢迎语：客户进入会话时发送（需 welcome_code）；留空关闭
 # allow_from = "*"                          # allowed external_userid list / 允许的客户 external_userid
 # api_base_url = "https://qyapi.weixin.qq.com"  # optional / 可选
 # proxy = ""                                # optional forward proxy for API calls / 可选正向代理
