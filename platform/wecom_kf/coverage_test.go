@@ -34,6 +34,7 @@ func TestCoverageNewDefaultsAndInvalidOptions(t *testing.T) {
 	}
 	defaults := testOptions("")
 	delete(defaults, "api_base_url")
+	delete(defaults, "listen_addr")
 	p, err := New(defaults)
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +279,7 @@ func encryptAdapterCoverage(t *testing.T, message []byte, receiveID string, key 
 	binary.BigEndian.PutUint32(body[16:20], uint32(len(message)))
 	body = append(body, message...)
 	body = append(body, receiveID...)
-	pad := aes.BlockSize - len(body)%aes.BlockSize
+	pad := 32 - len(body)%32
 	body = append(body, bytes.Repeat([]byte{byte(pad)}, pad)...)
 	out := make([]byte, len(body))
 	cipher.NewCBCEncrypter(block, key[:aes.BlockSize]).CryptBlocks(out, body)
