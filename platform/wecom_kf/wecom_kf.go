@@ -2,8 +2,8 @@ package wecom_kf
 
 import (
 	"context"
-	"crypto/sha1"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -290,4 +290,3 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 }
 
 var _ core.Platform = (*Platform)(nil)
-var _ = sha1.Sum
