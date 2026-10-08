@@ -2,6 +2,9 @@ package wecomkf
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/binary"
 	"encoding/base64"
 	"errors"
 	"testing"
