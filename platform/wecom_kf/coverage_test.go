@@ -109,7 +109,8 @@ func TestCoverageCallbackAllBranches(t *testing.T) {
 		t.Fatalf("bad POST signature status=%d", r.Code)
 	}
 	validQuery := "msg_signature=" + sig + "&timestamp=10&nonce=n"
-	if r := post("<xml><Encrypt>bad</Encrypt></xml>", validQuery); r.Code != http.StatusBadRequest {
+	badCipherSig := signPlatformTest(p.callbackToken, "10", "n", "bad")
+	if r := post("<xml><Encrypt>bad</Encrypt></xml>", "msg_signature="+badCipherSig+"&timestamp=10&nonce=n"); r.Code != http.StatusBadRequest {
 		t.Fatalf("bad POST decrypt status=%d", r.Code)
 	}
 	badEvent := encryptAdapterCoverage(t, []byte("<xml><Event>wrong</Event></xml>"), p.corpID, p.aesKey)
