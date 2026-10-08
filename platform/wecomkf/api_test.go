@@ -19,7 +19,7 @@ func TestClientSyncAndSend(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/cgi-bin/kf/sync_msg" {
-			_, _ = w.Write([]byte(`{"errcode":0,"next_cursor":"c2","has_more":true,"msg_list":[{"msgid":"m1","open_kfid":"wk1","external_userid":"u1","origin":3,"msgtype":"text","text":{"content":"hello"}}]}`))
+			_, _ = w.Write([]byte(`{"errcode":0,"next_cursor":"c2","has_more":1,"msg_list":[{"msgid":"m1","open_kfid":"wk1","external_userid":"u1","origin":3,"msgtype":"text","text":{"content":"hello"}}]}`))
 			return
 		}
 		if body["msgtype"] != "text" {
@@ -34,7 +34,7 @@ func TestClientSyncAndSend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncMessages() error = %v", err)
 	}
-	if got.NextCursor != "c2" || !got.HasMore || len(got.MsgList) != 1 {
+	if got.NextCursor != "c2" || !bool(got.HasMore) || len(got.MsgList) != 1 {
 		t.Fatalf("unexpected response: %+v", got)
 	}
 	if err := client.SendText(context.Background(), "token", SendTextRequest{ToUser: "u1", OpenKfID: "wk1", Text: MessageText{Content: "answer"}}); err != nil {
