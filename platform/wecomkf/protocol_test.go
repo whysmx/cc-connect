@@ -71,9 +71,9 @@ func encryptCallbackForTest(t *testing.T, message []byte, receiveID string, key 
 	binary.BigEndian.PutUint32(body[16:20], uint32(len(message)))
 	body = append(body, message...)
 	body = append(body, receiveID...)
-	pad := aes.BlockSize - len(body)%aes.BlockSize
+	pad := 32 - len(body)%32
 	body = append(body, bytes.Repeat([]byte{byte(pad)}, pad)...)
 	ciphertext := make([]byte, len(body))
-	cipher.NewCBCEncrypter(block, make([]byte, aes.BlockSize)).CryptBlocks(ciphertext, body)
+	cipher.NewCBCEncrypter(block, key[:aes.BlockSize]).CryptBlocks(ciphertext, body)
 	return base64.StdEncoding.EncodeToString(ciphertext)
 }
