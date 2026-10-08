@@ -52,6 +52,7 @@ type Platform struct {
 	handler      core.MessageHandler
 
 	mu     sync.Mutex
+	pullMu sync.Mutex
 	cursor string
 	seen   map[string]time.Time
 	token  tokenCache
@@ -171,6 +172,8 @@ func (p *Platform) handleVerify(w http.ResponseWriter, signature, timestamp, non
 }
 
 func (p *Platform) pullMessages(pullToken, openKfID string) {
+	p.pullMu.Lock()
+	defer p.pullMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	accessToken, err := p.accessToken(ctx)
@@ -202,6 +205,10 @@ func (p *Platform) pullMessages(pullToken, openKfID string) {
 					Content: msg.Text.Content, ReplyCtx: rc, UserMessageTimeMs: msg.SendTime * 1000,
 				})
 			}
+		}
+		if res.HasMore && res.NextCursor == cursor {
+			slog.Error("wecom-kf: sync messages returned unchanged cursor with has_more")
+			return
 		}
 		cursor = res.NextCursor
 		p.mu.Lock()
