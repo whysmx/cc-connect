@@ -189,7 +189,9 @@ func (p *Platform) pullMessages(pullToken, openKfID string) {
 	p.mu.Lock()
 	cursor := p.cursor
 	p.mu.Unlock()
+	page := 0
 	for {
+		page++
 		res, err := p.client.SyncMessages(ctx, accessToken, wecomkf.SyncMessageRequest{Cursor: cursor, Token: pullToken, OpenKfID: openKfID, Limit: 1000})
 		if err != nil {
 			slog.Error("wecom-kf: sync messages failed", "error", err, "page", page, "cursor_tag", cursorTag(cursor))
