@@ -187,3 +187,23 @@ func TestCursorTag(t *testing.T) {
 	if got := cursorTag(""); got != "empty" { t.Fatalf("empty cursor tag = %q", got) }
 	if got := cursorTag("secret-cursor"); len(got) != 8 { t.Fatalf("cursor tag length = %d", len(got)) }
 }
+
+
+func TestCallbackRejectsDecryptAndEventErrors(t *testing.T) {
+	p, err := New(testOptions("http://127.0.0.1"))
+	if err != nil { t.Fatal(err) }
+	platform := p.(*Platform)
+	sig := signPlatformTest(platform.callbackToken, "1", "nonce", "not-base64")
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/wecom-kf/callback?msg_signature="+sig+"&timestamp=1&nonce=nonce", strings.NewReader("<xml><Encrypt>not-base64</Encrypt></xml>"))
+	platform.callbackHandler(rr, req)
+	if rr.Code != http.StatusBadRequest { t.Fatalf("decrypt error status = %d", rr.Code) }
+
+	badEvent := []byte("<xml><Event>other</Event><Token>pull</Token><OpenKfId>wk1</OpenKfId></xml>")
+	encrypted := encryptPlatformTest(t, badEvent, "corp", platform.aesKey)
+	sig = signPlatformTest(platform.callbackToken, "2", "nonce", encrypted)
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/wecom-kf/callback?msg_signature="+sig+"&timestamp=2&nonce=nonce", strings.NewReader("<xml><Encrypt>"+encrypted+"</Encrypt></xml>"))
+	platform.callbackHandler(rr, req)
+	if rr.Code != http.StatusBadRequest { t.Fatalf("event error status = %d", rr.Code) }
+}
