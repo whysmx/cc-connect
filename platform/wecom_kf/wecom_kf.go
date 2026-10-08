@@ -2,6 +2,7 @@ package wecom_kf
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -121,6 +122,8 @@ func (p *Platform) Stop() error {
 	return p.server.Shutdown(context.Background())
 }
 
+func cursorTag(cursor string) string { if cursor == "" { return "empty" }; sum := sha256.Sum256([]byte(cursor)); return fmt.Sprintf("%x", sum[:4]) }
+
 func (p *Platform) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	signature, timestamp, nonce := q.Get("msg_signature"), q.Get("timestamp"), q.Get("nonce")
@@ -148,11 +151,13 @@ func (p *Platform) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad encrypted payload", http.StatusBadRequest)
 		return
 	}
+	slog.Info("wecom-kf callback decrypted", "bytes", len(plain))
 	event, err := wecomkf.ParseEvent([]byte(plain))
 	if err != nil || event.OpenKfID != p.openKfID {
 		http.Error(w, "bad event", http.StatusBadRequest)
 		return
 	}
+	slog.Info("wecom-kf callback accepted", "open_kfid", event.OpenKfID)
 	w.WriteHeader(http.StatusOK)
 	go p.pullMessages(event.Token, event.OpenKfID)
 }
@@ -187,18 +192,19 @@ func (p *Platform) pullMessages(pullToken, openKfID string) {
 	for {
 		res, err := p.client.SyncMessages(ctx, accessToken, wecomkf.SyncMessageRequest{Cursor: cursor, Token: pullToken, OpenKfID: openKfID, Limit: 1000})
 		if err != nil {
-			slog.Error("wecom-kf: sync messages failed", "error", err)
+			slog.Error("wecom-kf: sync messages failed", "error", err, "page", page, "cursor_tag", cursorTag(cursor))
 			return
 		}
+		slog.Info("wecom-kf sync page", "page", page, "cursor_tag", cursorTag(cursor), "next_cursor_tag", cursorTag(res.NextCursor), "messages", len(res.MsgList), "has_more", bool(res.HasMore))
 		for _, msg := range res.MsgList {
 			if msg.Origin != 3 || msg.MsgType != "text" || msg.Text == nil || msg.ExternalUserID == "" {
 				continue
 			}
-			if p.duplicate(msg.MsgID) || !core.AllowList(p.allowFrom, msg.ExternalUserID) {
-				continue
-			}
+			if p.duplicate(msg.MsgID) { slog.Info("wecom-kf message deduplicated", "msg_id", msg.MsgID); continue }
+			if !core.AllowList(p.allowFrom, msg.ExternalUserID) { slog.Info("wecom-kf message rejected", "reason", "allow_list"); continue }
 			rc := replyContext{toUser: msg.ExternalUserID, openKfID: msg.OpenKfID, msgID: msg.MsgID}
 			if p.handler != nil {
+				slog.Info("wecom-kf message dispatch", "msg_id", msg.MsgID, "open_kfid", msg.OpenKfID, "service_state", "unknown")
 				p.handler(p, &core.Message{
 					SessionKey: fmt.Sprintf("wecom-kf:%s:%s", msg.OpenKfID, msg.ExternalUserID),
 					Platform: p.Name(), MessageID: msg.MsgID, UserID: msg.ExternalUserID,
@@ -295,12 +301,14 @@ func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) erro
 		if i == 0 {
 			msgID = rc.msgID
 		}
+		slog.Info("wecom-kf send attempt", "chunk", i+1, "msg_id", msgID)
 		if err := p.client.SendText(ctx, accessToken, wecomkf.SendTextRequest{
 			ToUser: rc.toUser, OpenKfID: rc.openKfID, MsgID: msgID,
 			Text: wecomkf.MessageText{Content: chunk},
 		}); err != nil {
-			return err
+			slog.Error("wecom-kf send failed", "chunk", i+1, "msg_id", msgID, "error", err); return err
 		}
+		slog.Info("wecom-kf send succeeded", "chunk", i+1, "msg_id", msgID)
 	}
 	return nil
 }
