@@ -252,8 +252,48 @@ func TestHandleMsgCallback_SingleChat_ChatIDFallback(t *testing.T) {
 		if rc.chatID != "zhangsan" {
 			t.Fatalf("expected chatID to fall back to userID 'zhangsan', got %q", rc.chatID)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("handler not called")
+	}
+}
+
+func TestPrivateMessagesAggregateTextAndFile(t *testing.T) {
+	p, captured := newCapturedWSPlatform()
+	sessionKey := "wecom:zhangsan:zhangsan"
+
+	p.emitInbound("single", &core.Message{
+		SessionKey: sessionKey,
+		MessageID:  "text-1",
+		Content:    "analyze this file",
+		ReplyCtx:   wsReplyContext{chatID: "zhangsan", userID: "zhangsan"},
+	})
+	p.emitInbound("single", &core.Message{
+		SessionKey: sessionKey,
+		MessageID:  "file-1",
+		Files: []core.FileAttachment{{
+			FileName: "report.txt",
+			MimeType: "text/plain",
+			Data:     []byte("report"),
+		}},
+		ReplyCtx: wsReplyContext{chatID: "zhangsan", userID: "zhangsan"},
+	})
+
+	select {
+	case msg := <-captured:
+		if msg.Content != "analyze this file" {
+			t.Fatalf("Content = %q", msg.Content)
+		}
+		if len(msg.Files) != 1 || msg.Files[0].FileName != "report.txt" {
+			t.Fatalf("Files = %#v", msg.Files)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("aggregated handler not called")
+	}
+
+	select {
+	case msg := <-captured:
+		t.Fatalf("handler called more than once: %#v", msg)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

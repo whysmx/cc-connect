@@ -37,6 +37,58 @@ type WSPlatform struct {
 	reqSeq      atomic.Int64 // monotonic counter for generating unique req_id
 	missedPong  atomic.Int32 // consecutive heartbeat acks not received
 	pendingAcks sync.Map     // req_id -> chan wsAckResult, for sequential send with ack waiting
+	aggMu       sync.Mutex
+	agg         map[string]*wsAggregate
+}
+
+type wsAggregate struct {
+	msg   *core.Message
+	timer *time.Timer
+}
+
+const wsPrivateAggregateWindow = 2 * time.Second
+
+func (p *WSPlatform) emitInbound(chatType string, msg *core.Message) {
+	if chatType == "single" {
+		p.emitPrivate(msg)
+		return
+	}
+	p.handler(p, msg)
+}
+
+func (p *WSPlatform) emitPrivate(msg *core.Message) {
+	if msg == nil || msg.SessionKey == "" {
+		p.handler(p, msg)
+		return
+	}
+	p.aggMu.Lock()
+	if p.agg == nil {
+		p.agg = make(map[string]*wsAggregate)
+	}
+	if a := p.agg[msg.SessionKey]; a != nil {
+		a.msg.Content = strings.TrimSpace(strings.Join([]string{a.msg.Content, msg.Content}, "\n"))
+		a.msg.Images = append(a.msg.Images, msg.Images...)
+		a.msg.Files = append(a.msg.Files, msg.Files...)
+		if msg.Audio != nil {
+			a.msg.Audio = msg.Audio
+		}
+		a.msg.MessageID, a.msg.ReplyCtx = msg.MessageID, msg.ReplyCtx
+		a.timer.Reset(wsPrivateAggregateWindow)
+		p.aggMu.Unlock()
+		return
+	}
+	cp := *msg
+	a := &wsAggregate{msg: &cp}
+	a.timer = time.AfterFunc(wsPrivateAggregateWindow, func() {
+		p.aggMu.Lock()
+		if p.agg[msg.SessionKey] == a {
+			delete(p.agg, msg.SessionKey)
+		}
+		p.aggMu.Unlock()
+		p.handler(p, a.msg)
+	})
+	p.agg[msg.SessionKey] = a
+	p.aggMu.Unlock()
 }
 
 const (
@@ -427,7 +479,7 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 		}
 		content := stripWeComAtMentions(strings.Join(current.content, "\n"), p.botID, body.AibotID)
 		slog.Debug("wecom-ws: voice received (transcribed)", "user", body.From.UserID, "len", len(content))
-		go p.handler(p, &core.Message{
+		go p.emitInbound(body.ChatType, &core.Message{
 			SessionKey: sessionKey, Platform: "wecom",
 			MessageID: body.MsgID,
 			UserID:    body.From.UserID, UserName: body.From.UserID,
@@ -444,7 +496,7 @@ func (p *WSPlatform) handleMsgCallback(frame wsFrame) {
 		}
 		content := stripWeComAtMentions(strings.Join(current.content, "\n"), p.botID, body.AibotID)
 		slog.Debug("wecom-ws: text received", "user", body.From.UserID, "len", len(content))
-		go p.handler(p, &core.Message{
+		go p.emitInbound(body.ChatType, &core.Message{
 			SessionKey: sessionKey, Platform: "wecom",
 			MessageID: body.MsgID,
 			UserID:    body.From.UserID, UserName: body.From.UserID,
