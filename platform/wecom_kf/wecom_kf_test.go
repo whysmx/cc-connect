@@ -106,10 +106,10 @@ func encryptPlatformTest(t *testing.T, message []byte, receiveID string, key []b
 	body := append(bytes.Repeat([]byte{0x55}, 16), make([]byte, 4)...)
 	binary.BigEndian.PutUint32(body[16:20], uint32(len(message)))
 	body = append(body, message...); body = append(body, receiveID...)
-	pad := aes.BlockSize - len(body)%aes.BlockSize
+	pad := 32 - len(body)%32
 	body = append(body, bytes.Repeat([]byte{byte(pad)}, pad)...)
 	out := make([]byte, len(body))
-	cipher.NewCBCEncrypter(block, make([]byte, aes.BlockSize)).CryptBlocks(out, body)
+	cipher.NewCBCEncrypter(block, key[:aes.BlockSize]).CryptBlocks(out, body)
 	return base64.StdEncoding.EncodeToString(out)
 }
 
