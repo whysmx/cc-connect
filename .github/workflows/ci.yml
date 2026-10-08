@@ -131,6 +131,7 @@ jobs:
             name="$(basename "$pkg")"
             profile="coverage-$name.out"
             go test "$pkg" -coverprofile="$profile" -covermode=atomic
+            go tool cover -func="$profile"
             total="$(go tool cover -func="$profile" | awk '/total:/ {gsub("%","",$3); print $3}')"
             echo "$pkg coverage: ${total}%"
             awk -v total="${total}" 'BEGIN { if (total + 0 < 95) { exit 1 } }'
