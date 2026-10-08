@@ -181,3 +181,9 @@ func TestPullMessagesSerializesConcurrentCallbacks(t *testing.T) {
 		t.Fatalf("maximum concurrent sync requests = %d, want 1", got)
 	}
 }
+
+
+func TestCursorTag(t *testing.T) {
+	if got := cursorTag(""); got != "empty" { t.Fatalf("empty cursor tag = %q", got) }
+	if got := cursorTag("secret-cursor"); len(got) != 8 { t.Fatalf("cursor tag length = %d", len(got)) }
+}
