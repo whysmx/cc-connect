@@ -77,3 +77,13 @@ func encryptCallbackForTest(t *testing.T, message []byte, receiveID string, key 
 	cipher.NewCBCEncrypter(block, key[:aes.BlockSize]).CryptBlocks(ciphertext, body)
 	return base64.StdEncoding.EncodeToString(ciphertext)
 }
+
+
+func TestDecryptKnownWeComVector(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key { key[i] = byte(i) }
+	ciphertext := "8pAAtipJn9Cp85pq3S53gMNYZ/nk9gCefIH9dVROJ6CoaHHESPRUJEuOhJXKB7rNlBDDP764DRy3mQFSXf+Syg=="
+	plain, err := Decrypt(ciphertext, key, "corp")
+	if err != nil { t.Fatalf("Decrypt() error = %v", err) }
+	if plain != "hello-world!" { t.Fatalf("plain = %q", plain) }
+}
