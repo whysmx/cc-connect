@@ -4,17 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/aes"
+	"github.com/chenhg5/cc-connect/core"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func testOptions(baseURL string) map[string]any {
@@ -120,5 +119,3 @@ func signPlatformTest(token, timestamp, nonce, encrypted string) string {
 func sortStrings(values []string) { for i := range values { for j := i + 1; j < len(values); j++ { if values[j] < values[i] { values[i], values[j] = values[j], values[i] } } } }
 func sha1Hex(s string) string { h := sha1.Sum([]byte(s)); return fmt.Sprintf("%x", h[:]) }
 
-var _ = xml.Name{}
-var _ = time.Second
