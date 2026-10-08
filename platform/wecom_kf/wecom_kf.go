@@ -273,9 +273,13 @@ func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) erro
 	if err != nil {
 		return err
 	}
-	for _, chunk := range wecomkf.SplitTextByBytes(core.StripMarkdown(content), 2048) {
+	for i, chunk := range wecomkf.SplitTextByBytes(core.StripMarkdown(content), 2048) {
+		msgID := ""
+		if i == 0 {
+			msgID = rc.msgID
+		}
 		if err := p.client.SendText(ctx, accessToken, wecomkf.SendTextRequest{
-			ToUser: rc.toUser, OpenKfID: rc.openKfID, MsgID: rc.msgID,
+			ToUser: rc.toUser, OpenKfID: rc.openKfID, MsgID: msgID,
 			Text: wecomkf.MessageText{Content: chunk},
 		}); err != nil {
 			return err
