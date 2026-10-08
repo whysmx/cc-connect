@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/aes"
-	"github.com/chenhg5/cc-connect/core"
+	"crypto/sha1"
+	"fmt"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/binary"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/chenhg5/cc-connect/core"
 )
 
 func testOptions(baseURL string) map[string]any {
