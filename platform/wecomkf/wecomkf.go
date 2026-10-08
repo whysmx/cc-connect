@@ -12,8 +12,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +37,9 @@ const (
 	maxSyncPages      = 50
 	sendAttempts      = 3
 	truncationMarker  = "\n…"
+	// maxMediaBytes caps a single download. WeChat Customer Service itself
+	// limits media to 2 MB (image/voice), 10 MB (video) and 20 MB (file).
+	maxMediaBytes = 25 << 20
 )
 
 func init() {
@@ -59,6 +64,8 @@ type Platform struct {
 	allowFrom     string
 	takeoverCheck bool
 	maxReplies    int
+	inboundMedia  bool
+	mergeWindow   time.Duration
 	// skipBacklog is true when no cursor was persisted yet: the first pull
 	// returns up to 3 days of history, which must not be answered.
 	skipBacklog bool
@@ -75,6 +82,9 @@ type Platform struct {
 	syncing      bool
 	syncPending  bool
 	pendingToken string
+
+	aggMu sync.Mutex
+	agg   map[string]*aggregate // session key -> pending merged message
 
 	budgetMu sync.Mutex
 	budget   map[string]int // external_userid -> messages still allowed
@@ -132,14 +142,20 @@ func New(opts map[string]any) (core.Platform, error) {
 	if v, ok := opts["takeover_check"].(bool); ok {
 		takeoverCheck = v
 	}
+	inboundMedia := true
+	if v, ok := opts["inbound_media"].(bool); ok {
+		inboundMedia = v
+	}
+	mergeWindow := defaultMergeWindow
+	if ms, ok := intOption(opts["merge_window_ms"]); ok {
+		if ms < 0 {
+			ms = 0
+		}
+		mergeWindow = time.Duration(ms) * time.Millisecond
+	}
 	maxReplies := defaultMaxReplies
-	switch v := opts["max_replies_per_message"].(type) {
-	case int64:
-		maxReplies = int(v)
-	case int:
+	if v, ok := intOption(opts["max_replies_per_message"]); ok {
 		maxReplies = v
-	case float64:
-		maxReplies = int(v)
 	}
 	if maxReplies <= 0 {
 		maxReplies = defaultMaxReplies
@@ -166,11 +182,28 @@ func New(opts map[string]any) (core.Platform, error) {
 		allowFrom:     allowFrom,
 		takeoverCheck: takeoverCheck,
 		maxReplies:    maxReplies,
+		inboundMedia:  inboundMedia,
+		mergeWindow:   mergeWindow,
+		agg:           make(map[string]*aggregate),
 		api:           newAPIClient(apiBaseURL, corpID, corpSecret, httpClient),
 		store:         store,
 		skipBacklog:   store.Cursor() == "",
 		budget:        make(map[string]int),
 	}, nil
+}
+
+// intOption reads an integer option as decoded from TOML (int64) or JSON
+// (float64).
+func intOption(v any) (int, bool) {
+	switch n := v.(type) {
+	case int64:
+		return int(n), true
+	case int:
+		return n, true
+	case float64:
+		return int(n), true
+	}
+	return 0, false
 }
 
 func (p *Platform) Name() string { return platformName }
@@ -197,6 +230,7 @@ func (p *Platform) Stop() error {
 		p.cancel()
 	}
 	p.wg.Wait()
+	p.dropAggregates()
 	return err
 }
 
@@ -334,8 +368,13 @@ func (p *Platform) processMessage(ctx context.Context, m *kfMessage) {
 		slog.Warn("wecom_kf: customer rejected by allow_from", "external_userid", m.ExternalUserID)
 		return
 	}
-	if m.MsgType != "text" || m.Text == nil || strings.TrimSpace(m.Text.Content) == "" {
+	kind, mediaID := classifyMessage(m)
+	if kind == "" {
 		slog.Info("wecom_kf: unsupported customer message type ignored", "msgtype", m.MsgType, "external_userid", m.ExternalUserID)
+		return
+	}
+	if kind != "text" && !p.inboundMedia {
+		slog.Info("wecom_kf: inbound media disabled, message ignored", "msgtype", kind, "external_userid", m.ExternalUserID)
 		return
 	}
 	if !p.aiAllowed(ctx, m.ExternalUserID, "dispatch") {
@@ -352,13 +391,123 @@ func (p *Platform) processMessage(ctx context.Context, m *kfMessage) {
 		MessageID:         m.MsgID,
 		UserID:            m.ExternalUserID,
 		UserName:          m.ExternalUserID,
-		Content:           m.Text.Content,
 		ReplyCtx:          replyContext{openKfID: p.openKfID, externalUserID: m.ExternalUserID, msgID: m.MsgID},
 		UserMessageTimeMs: m.SendTime * 1000,
 	}
-	slog.Info("wecom_kf: customer message dispatched", "project", p.project, "open_kfid", p.openKfID,
-		"external_userid", m.ExternalUserID, "msgid", m.MsgID, "text_len", len(m.Text.Content))
-	go p.handler(p, msg)
+	if kind == "text" {
+		msg.Content = m.Text.Content
+		slog.Info("wecom_kf: customer message accepted", "project", p.project, "open_kfid", p.openKfID,
+			"external_userid", m.ExternalUserID, "msgid", m.MsgID, "text_len", len(m.Text.Content))
+		p.emit(msg)
+		return
+	}
+
+	// Media is downloaded off the pull loop so a large file does not delay
+	// other customers' messages. Stop waits for in-flight downloads. The
+	// aggregator is told up front so a question sent right after a file
+	// waits for the file instead of overtaking it.
+	p.reserve(msg)
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		if err := p.attachMedia(ctx, msg, kind, mediaID); err != nil {
+			slog.Error("wecom_kf: download customer media failed", "msgtype", kind, "msgid", m.MsgID,
+				"external_userid", m.ExternalUserID, "error", err)
+			p.complete(msg.SessionKey, nil)
+			return
+		}
+		slog.Info("wecom_kf: customer media accepted", "project", p.project, "open_kfid", p.openKfID,
+			"external_userid", m.ExternalUserID, "msgid", m.MsgID, "msgtype", kind)
+		p.complete(msg.SessionKey, msg)
+	}()
+}
+
+// classifyMessage returns the supported kind of a customer message ("text",
+// "image", "voice", "video", "file") and its media_id, or "" if the message
+// cannot be handed to the agent.
+func classifyMessage(m *kfMessage) (kind, mediaID string) {
+	media := func(md *kfMedia) (string, string) {
+		if md == nil || md.MediaID == "" {
+			return "", ""
+		}
+		return m.MsgType, md.MediaID
+	}
+	switch m.MsgType {
+	case "text":
+		if m.Text != nil && strings.TrimSpace(m.Text.Content) != "" {
+			return "text", ""
+		}
+	case "image":
+		return media(m.Image)
+	case "voice":
+		return media(m.Voice)
+	case "video":
+		return media(m.Video)
+	case "file":
+		return media(m.File)
+	}
+	return "", ""
+}
+
+// attachMedia downloads mediaID and attaches it to msg the way the core
+// expects: images as Images, voice as Audio (AMR, transcribed by the engine
+// when speech is configured), video and files as Files.
+func (p *Platform) attachMedia(ctx context.Context, msg *core.Message, kind, mediaID string) error {
+	media, err := p.api.downloadMedia(ctx, mediaID, maxMediaBytes)
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case "image":
+		msg.Images = []core.ImageAttachment{{
+			MimeType: detectMime(media, "image/jpeg"),
+			Data:     media.Data,
+			FileName: media.FileName,
+		}}
+	case "voice":
+		// sync_msg returns AMR unless voice_format=1 (Silk) is requested.
+		msg.Audio = &core.AudioAttachment{MimeType: "audio/amr", Data: media.Data, Format: "amr"}
+	case "video":
+		msg.Files = []core.FileAttachment{{
+			MimeType: detectMime(media, "video/mp4"),
+			Data:     media.Data,
+			FileName: fallbackName(media.FileName, "video.mp4"),
+		}}
+	default: // file
+		msg.Files = []core.FileAttachment{{
+			MimeType: detectMime(media, "application/octet-stream"),
+			Data:     media.Data,
+			FileName: fallbackName(media.FileName, "attachment"),
+		}}
+	}
+	return nil
+}
+
+// detectMime picks a MIME type from the file extension, the response header
+// or the content itself, in that order.
+func detectMime(media *downloadedMedia, fallback string) string {
+	const generic = "application/octet-stream"
+	if ext := strings.ToLower(filepath.Ext(media.FileName)); ext != "" {
+		if mt := mime.TypeByExtension(ext); mt != "" && !strings.HasPrefix(mt, generic) {
+			return mt
+		}
+	}
+	if mt, _, err := mime.ParseMediaType(media.ContentType); err == nil && mt != generic && mt != "text/plain" {
+		return mt
+	}
+	if len(media.Data) > 0 {
+		if mt := http.DetectContentType(media.Data); !strings.HasPrefix(mt, generic) && !strings.HasPrefix(mt, "text/plain") {
+			return mt
+		}
+	}
+	return fallback
+}
+
+func fallbackName(name, def string) string {
+	if name == "" {
+		return def
+	}
+	return name
 }
 
 func (p *Platform) logEvent(m *kfMessage) {

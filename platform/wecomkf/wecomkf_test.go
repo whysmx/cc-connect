@@ -30,6 +30,15 @@ type fakeWeCom struct {
 	tokenCalls int
 	expireNext bool           // next API call answers 42001
 	fail       map[string]int // path -> errcode to return
+	media      map[string]fakeMedia
+	mediaGate  chan struct{} // when set, media/get blocks until it is closed
+	mediaCalls int
+}
+
+type fakeMedia struct {
+	data        []byte
+	contentType string
+	disposition string
 }
 
 type sentMsg struct {
@@ -44,6 +53,10 @@ func newFakeWeCom(t *testing.T) *fakeWeCom {
 }
 
 func (f *fakeWeCom) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/cgi-bin/media/get" {
+		f.serveMedia(w, r)
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if code, ok := f.fail[r.URL.Path]; ok {
@@ -90,6 +103,42 @@ func (f *fakeWeCom) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (f *fakeWeCom) serveMedia(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.mediaCalls++
+	gate := f.mediaGate
+	m, ok := f.media[r.URL.Query().Get("media_id")]
+	code, failing := f.fail[r.URL.Path]
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	if failing || !ok {
+		if !failing {
+			code = 40007 // invalid media_id
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]any{"errcode": code, "errmsg": "media error"})
+		return
+	}
+	if m.contentType != "" {
+		w.Header().Set("Content-Type", m.contentType)
+	}
+	if m.disposition != "" {
+		w.Header().Set("Content-Disposition", m.disposition)
+	}
+	_, _ = w.Write(m.data)
+}
+
+func (f *fakeWeCom) addMedia(id string, m fakeMedia) {
+	f.mu.Lock()
+	if f.media == nil {
+		f.media = map[string]fakeMedia{}
+	}
+	f.media[id] = m
+	f.mu.Unlock()
 }
 
 func (f *fakeWeCom) addPage(openKfID string, page syncMsgResponse) {
@@ -181,6 +230,8 @@ func newTestPlatform(t *testing.T, f *fakeWeCom, o platformOpts) *Platform {
 		"callback_token": o.token, "callback_aes_key": testAESKeyEncoded,
 		"listen_addr": o.listen, "callback_path": o.path, "api_base_url": f.srv.URL,
 		"cc_project": o.project, "cc_data_dir": o.dataDir,
+		// Most tests check one message at a time; aggregation has its own tests.
+		"merge_window_ms": int64(0),
 	}
 	for k, v := range o.extra {
 		opts[k] = v

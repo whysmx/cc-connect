@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -73,6 +75,11 @@ type kfText struct {
 	MenuID  string `json:"menu_id,omitempty"`
 }
 
+// kfMedia is the payload of image / voice / video / file messages.
+type kfMedia struct {
+	MediaID string `json:"media_id"`
+}
+
 type kfEvent struct {
 	EventType      string `json:"event_type"`
 	OpenKfID       string `json:"open_kfid"`
@@ -94,6 +101,10 @@ type kfMessage struct {
 	ServicerUserID string   `json:"servicer_userid"`
 	MsgType        string   `json:"msgtype"`
 	Text           *kfText  `json:"text,omitempty"`
+	Image          *kfMedia `json:"image,omitempty"`
+	Voice          *kfMedia `json:"voice,omitempty"`
+	Video          *kfMedia `json:"video,omitempty"`
+	File           *kfMedia `json:"file,omitempty"`
 	Event          *kfEvent `json:"event,omitempty"`
 }
 
@@ -284,6 +295,93 @@ func (c *apiClient) sendText(ctx context.Context, openKfID, externalUserID, cont
 		return "", err
 	}
 	return out.MsgID, nil
+}
+
+// downloadedMedia is a temporary media file fetched with media/get.
+type downloadedMedia struct {
+	Data        []byte
+	FileName    string // from Content-Disposition, may be empty
+	ContentType string // from the response header, may be empty
+}
+
+// downloadMedia fetches a temporary media file (image, voice, video, file)
+// referenced by a kf/sync_msg message. WeCom answers errors as JSON instead
+// of the binary body; a stale access_token is refreshed once. Bodies larger
+// than maxBytes are rejected.
+func (c *apiClient) downloadMedia(ctx context.Context, mediaID string, maxBytes int64) (*downloadedMedia, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := c.accessToken(ctx, false)
+		if err != nil {
+			return nil, err
+		}
+		q := url.Values{"access_token": {token}, "media_id": {mediaID}}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/cgi-bin/media/get?"+q.Encode(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("wecom_kf: media/get: build request: %w", err)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("wecom_kf: media/get: %s", core.RedactToken(err.Error(), token))
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("wecom_kf: media/get: read body: %w", readErr)
+		}
+		ct := resp.Header.Get("Content-Type")
+		if isJSONErrorBody(ct, data) {
+			var e baseResponse
+			if err := json.Unmarshal(data, &e); err != nil {
+				return nil, fmt.Errorf("wecom_kf: media/get: decode error response: %w", err)
+			}
+			if isTokenError(e.ErrCode) && attempt == 0 {
+				c.invalidateToken(token)
+				continue
+			}
+			return nil, &apiError{Op: "media/get", ErrCode: e.ErrCode, ErrMsg: e.ErrMsg}
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("wecom_kf: media/get: http %d", resp.StatusCode)
+		}
+		if int64(len(data)) > maxBytes {
+			return nil, fmt.Errorf("wecom_kf: media/get: file exceeds %d bytes", maxBytes)
+		}
+		return &downloadedMedia{Data: data, FileName: dispositionFileName(resp.Header.Get("Content-Disposition")), ContentType: ct}, nil
+	}
+	return nil, &apiError{Op: "media/get", ErrCode: -1, ErrMsg: "access_token refresh did not help"}
+}
+
+// isJSONErrorBody reports whether a media/get response is an errcode JSON
+// document rather than the media itself.
+func isJSONErrorBody(contentType string, data []byte) bool {
+	mt, _, _ := mime.ParseMediaType(contentType)
+	if mt != "application/json" && mt != "text/plain" {
+		return false
+	}
+	trimmed := bytes.TrimSpace(data)
+	return len(trimmed) > 0 && trimmed[0] == '{' && bytes.Contains(trimmed, []byte(`"errcode"`))
+}
+
+// dispositionFileName extracts a safe base file name from a
+// Content-Disposition header (supports filename*= and URL-encoded names).
+func dispositionFileName(header string) string {
+	if header == "" {
+		return ""
+	}
+	_, params, err := mime.ParseMediaType(header)
+	if err != nil {
+		return ""
+	}
+	name := params["filename"]
+	if unescaped, err := url.PathUnescape(name); err == nil {
+		name = unescaped
+	}
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	name = path.Base(name)
+	if name == "." || name == "/" || name == ".." {
+		return ""
+	}
+	return name
 }
 
 // aiMayReply reports whether the API (AI) is allowed to answer in the given
