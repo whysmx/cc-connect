@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -116,6 +117,10 @@ func New(opts map[string]any) (core.Platform, error) {
 	if listenAddr == "" {
 		listenAddr = defaultListenAddr
 	}
+	if !isLoopbackAddr(listenAddr) {
+		slog.Warn("wecom_kf: listen_addr is not a loopback address; expose only the callback through an HTTPS reverse proxy",
+			"listen_addr", listenAddr)
+	}
 	callbackPath := str("callback_path")
 	if callbackPath == "" {
 		callbackPath = defaultCallbackPath
@@ -199,6 +204,21 @@ func New(opts map[string]any) (core.Platform, error) {
 		skipBacklog:    store.Cursor() == "",
 		budget:         make(map[string]int),
 	}, nil
+}
+
+// isLoopbackAddr reports whether a host:port listen address only accepts
+// local connections (127.0.0.0/8, ::1 or localhost). An empty host such as
+// ":8081" listens on all interfaces.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // intOption reads an integer option as decoded from TOML (int64) or JSON

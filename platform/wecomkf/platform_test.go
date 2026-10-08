@@ -265,3 +265,21 @@ func TestTakeBudget_DefaultsForUnknownCustomer(t *testing.T) {
 		t.Fatalf("granted %d, want %d", got, defaultMaxReplies-2)
 	}
 }
+
+func TestIsLoopbackAddr(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:8081": true,
+		"127.0.0.2:80":   true,
+		"[::1]:8081":     true,
+		"localhost:8081": true,
+		":8081":          false,
+		"0.0.0.0:8081":   false,
+		"10.0.0.5:8081":  false,
+		"example.com:80": false,
+		"no-port":        false,
+	} {
+		if got := isLoopbackAddr(addr); got != want {
+			t.Errorf("isLoopbackAddr(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
