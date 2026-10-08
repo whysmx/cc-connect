@@ -71,8 +71,8 @@ func Decrypt(encrypted string, aesKey []byte, expectedReceiveID string) (string,
 		return "", fmt.Errorf("wecomkf: create AES cipher: %w", err)
 	}
 	plain := make([]byte, len(ciphertext))
-	cipher.NewCBCDecrypter(block, make([]byte, aes.BlockSize)).CryptBlocks(plain, ciphertext)
-	plain, err = unpadPKCS7(plain, aes.BlockSize)
+	cipher.NewCBCDecrypter(block, aesKey[:aes.BlockSize]).CryptBlocks(plain, ciphertext)
+	plain, err = unpadPKCS7(plain, 32)
 	if err != nil || len(plain) < 20 {
 		return "", ErrInvalidCiphertext
 	}
