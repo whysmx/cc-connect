@@ -48,6 +48,9 @@ type SyncMessageResponse struct {
 type BoolInt bool
 
 func (b *BoolInt) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return fmt.Errorf("wecomkf: invalid boolean/integer flag %q", string(data))
+	}
 	if string(data) == "true" {
 		*b = true
 		return nil
