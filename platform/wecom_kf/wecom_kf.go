@@ -232,6 +232,16 @@ func (p *Platform) duplicate(id string) bool {
 	return false
 }
 
+func redactSecrets(s string, secrets ...string) string {
+	for _, secret := range secrets {
+		if secret == "" { continue }
+		for _, encoded := range []string{secret, url.QueryEscape(secret), url.PathEscape(secret)} {
+			s = strings.ReplaceAll(s, encoded, "[REDACTED]")
+		}
+	}
+	return s
+}
+
 func (p *Platform) accessToken(ctx context.Context) (string, error) {
 	p.token.mu.Lock()
 	defer p.token.mu.Unlock()
@@ -245,7 +255,7 @@ func (p *Platform) accessToken(ctx context.Context) (string, error) {
 	}
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("wecom-kf: gettoken request: %s", redactSecrets(err.Error(), p.corpID, p.corpSecret, p.callbackToken))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var body struct {
@@ -255,10 +265,10 @@ func (p *Platform) accessToken(ctx context.Context) (string, error) {
 		ExpiresIn  int    `json:"expires_in"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", err
+		return "", fmt.Errorf("wecom-kf: gettoken response: %s", redactSecrets(err.Error(), p.corpID, p.corpSecret, p.callbackToken))
 	}
 	if body.ErrCode != 0 || body.AccessToken == "" {
-		return "", fmt.Errorf("wecom-kf: gettoken %d %s", body.ErrCode, body.ErrMsg)
+		return "", fmt.Errorf("wecom-kf: gettoken %d %s", body.ErrCode, redactSecrets(body.ErrMsg, p.corpID, p.corpSecret, p.callbackToken))
 	}
 	p.token.value, p.token.expiresAt = body.AccessToken, time.Now().Add(time.Duration(body.ExpiresIn)*time.Second)
 	return p.token.value, nil
