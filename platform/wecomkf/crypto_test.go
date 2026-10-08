@@ -96,3 +96,49 @@ func TestParseCallbackEvent(t *testing.T) {
 		t.Fatal("malformed XML accepted")
 	}
 }
+
+func TestPKCS7UnpadAndMalformedPlaintext(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"empty":        nil,
+		"zero pad":     append(bytes.Repeat([]byte{'a'}, 31), 0),
+		"pad too big":  append(bytes.Repeat([]byte{'a'}, 31), 33),
+		"inconsistent": append(bytes.Repeat([]byte{'a'}, 30), 1, 2),
+	} {
+		if _, err := pkcs7Unpad(data); err != errInvalidCiphertext {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	if got, err := pkcs7Unpad(append([]byte("abc"), bytes.Repeat([]byte{29}, 29)...)); err != nil || string(got) != "abc" {
+		t.Fatalf("valid padding: %q, %v", got, err)
+	}
+
+	key := bytes.Repeat([]byte{0x11}, 32)
+	if _, err := decryptPayload(key[:16], "AAAA", ""); err == nil {
+		t.Fatal("short key accepted")
+	}
+	// Plaintext shorter than the 20-byte header, and a length field that
+	// points past the end, must both be rejected.
+	for name, plain := range map[string][]byte{
+		"short header": []byte("0123456789"),
+		"bad length":   append(append(bytes.Repeat([]byte{'r'}, 16), 0xff, 0xff, 0xff, 0xff), []byte("msg")...),
+	} {
+		if _, err := decryptPayload(key, encryptRawForTest(t, key, plain), ""); err != errInvalidCiphertext {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+// encryptRawForTest encrypts plain as-is (with padding) so malformed inner
+// layouts can be tested.
+func encryptRawForTest(t *testing.T, key, plain []byte) string {
+	t.Helper()
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pad := 32 - len(plain)%32
+	body := append(append([]byte(nil), plain...), bytes.Repeat([]byte{byte(pad)}, pad)...)
+	out := make([]byte, len(body))
+	cipher.NewCBCEncrypter(block, key[:16]).CryptBlocks(out, body)
+	return base64.StdEncoding.EncodeToString(out)
+}

@@ -28,7 +28,8 @@ type fakeWeCom struct {
 	states     map[string]int // external_userid -> service_state
 	sent       []sentMsg
 	tokenCalls int
-	expireNext bool // next API call answers 42001
+	expireNext bool           // next API call answers 42001
+	fail       map[string]int // path -> errcode to return
 }
 
 type sentMsg struct {
@@ -36,7 +37,7 @@ type sentMsg struct {
 }
 
 func newFakeWeCom(t *testing.T) *fakeWeCom {
-	f := &fakeWeCom{t: t, pages: map[string][]syncMsgResponse{}, states: map[string]int{}}
+	f := &fakeWeCom{t: t, pages: map[string][]syncMsgResponse{}, states: map[string]int{}, fail: map[string]int{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -45,6 +46,10 @@ func newFakeWeCom(t *testing.T) *fakeWeCom {
 func (f *fakeWeCom) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if code, ok := f.fail[r.URL.Path]; ok {
+		_ = json.NewEncoder(w).Encode(map[string]any{"errcode": code, "errmsg": "injected"})
+		return
+	}
 	if r.URL.Path == "/cgi-bin/gettoken" {
 		f.tokenCalls++
 		_ = json.NewEncoder(w).Encode(map[string]any{"errcode": 0, "access_token": fmt.Sprintf("tok%d", f.tokenCalls), "expires_in": 7200})
@@ -90,6 +95,12 @@ func (f *fakeWeCom) serve(w http.ResponseWriter, r *http.Request) {
 func (f *fakeWeCom) addPage(openKfID string, page syncMsgResponse) {
 	f.mu.Lock()
 	f.pages[openKfID] = append(f.pages[openKfID], page)
+	f.mu.Unlock()
+}
+
+func (f *fakeWeCom) setFail(path string, code int) {
+	f.mu.Lock()
+	f.fail[path] = code
 	f.mu.Unlock()
 }
 
