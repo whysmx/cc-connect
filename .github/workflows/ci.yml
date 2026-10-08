@@ -125,6 +125,13 @@ jobs:
       - name: Run tests with coverage
         run: go test ./... -coverprofile=coverage.out -covermode=atomic
 
+      - name: Enforce WeCom coverage threshold
+        run: |
+          go test ./platform/wecomkf ./platform/wecom_kf -coverprofile=wecom.cover -covermode=atomic
+          total="$(go tool cover -func=wecom.cover | awk '/total:/ {gsub("%","",$3); print $3}')"
+          echo "WeCom package coverage: ${total}%"
+          awk -v total="${total}" 'BEGIN { if (total + 0 < 95) { exit 1 } }'
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         if: github.event_name == 'push'
