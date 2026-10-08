@@ -143,11 +143,13 @@ func (p *Platform) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	var envelope encryptedEnvelope
 	if err := xml.Unmarshal(body, &envelope); err != nil || envelope.Encrypt == "" ||
 		!wecomkf.VerifySignature(p.callbackToken, timestamp, nonce, envelope.Encrypt, signature) {
+		slog.Warn("wecom-kf callback rejected", "stage", "signature_or_envelope")
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	plain, err := wecomkf.Decrypt(envelope.Encrypt, p.aesKey, p.corpID)
 	if err != nil {
+		slog.Warn("wecom-kf callback rejected", "stage", "decrypt")
 		http.Error(w, "bad encrypted payload", http.StatusBadRequest)
 		return
 	}
