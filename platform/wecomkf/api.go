@@ -98,6 +98,16 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("wecomkf: API error %d: %s", e.Code, e.Msg)
 }
 
+func redactSecrets(s string, secrets ...string) string {
+	for _, secret := range secrets {
+		if secret == "" { continue }
+		for _, encoded := range []string{secret, url.QueryEscape(secret), url.PathEscape(secret)} {
+			s = strings.ReplaceAll(s, encoded, "[REDACTED]")
+		}
+	}
+	return s
+}
+
 func (c *Client) SyncMessages(ctx context.Context, accessToken string, req SyncMessageRequest) (SyncMessageResponse, error) {
 	var out SyncMessageResponse
 	if req.Limit <= 0 || req.Limit > 1000 {
@@ -144,12 +154,12 @@ func (c *Client) postJSON(ctx context.Context, path, accessToken string, request
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("wecomkf: request %s: %w", path, err)
+		return fmt.Errorf("wecomkf: request %s: %s", path, redactSecrets(err.Error(), accessToken))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("wecomkf: read %s response: %w", path, err)
+		return fmt.Errorf("wecomkf: read %s response: %s", path, redactSecrets(err.Error(), accessToken))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("wecomkf: HTTP %d from %s", resp.StatusCode, path)
@@ -162,7 +172,7 @@ func (c *Client) postJSON(ctx context.Context, path, accessToken string, request
 		ErrMsg  string `json:"errmsg"`
 	}
 	if err := json.Unmarshal(data, &envelope); err == nil && envelope.ErrCode != 0 {
-		return &APIError{Code: envelope.ErrCode, Msg: envelope.ErrMsg}
+		return &APIError{Code: envelope.ErrCode, Msg: redactSecrets(envelope.ErrMsg, accessToken)}
 	}
 	return nil
 }
