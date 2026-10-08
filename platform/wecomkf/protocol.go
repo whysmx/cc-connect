@@ -1,7 +1,6 @@
 package wecomkf
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha1"
@@ -24,13 +23,13 @@ var (
 // The notification only announces that messages are available; callers must use
 // the Token and OpenKfId to pull them with kf/sync_msg.
 type CustomerServiceEvent struct {
-	XMLName    string `xml:"xml"`
-	ToUserName string `xml:"ToUserName"`
-	CreateTime int64 `xml:"CreateTime"`
-	MsgType    string `xml:"MsgType"`
-	Event      string `xml:"Event"`
-	Token      string `xml:"Token"`
-	OpenKfID   string `xml:"OpenKfId"`
+	XMLName    xml.Name `xml:"xml"`
+	ToUserName string   `xml:"ToUserName"`
+	CreateTime int64    `xml:"CreateTime"`
+	MsgType    string   `xml:"MsgType"`
+	Event      string   `xml:"Event"`
+	Token      string   `xml:"Token"`
+	OpenKfID   string   `xml:"OpenKfId"`
 }
 
 // VerifySignature verifies msg_signature using the WeCom SHA-1 rule.
