@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -122,3 +123,61 @@ func signPlatformTest(token, timestamp, nonce, encrypted string) string {
 func sortStrings(values []string) { for i := range values { for j := i + 1; j < len(values); j++ { if values[j] < values[i] { values[i], values[j] = values[j], values[i] } } } }
 func sha1Hex(s string) string { h := sha1.Sum([]byte(s)); return fmt.Sprintf("%x", h[:]) }
 
+
+
+func TestPullStopsOnUnchangedCursor(t *testing.T) {
+	var syncCalls int
+	var mu sync.Mutex
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			_, _ = w.Write([]byte(`{"errcode":0,"access_token":"access","expires_in":7200}`))
+		case "/cgi-bin/kf/sync_msg":
+			mu.Lock(); syncCalls++; mu.Unlock()
+			_, _ = w.Write([]byte(`{"errcode":0,"next_cursor":"","has_more":true,"msg_list":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	p, err := New(testOptions(api.URL))
+	if err != nil { t.Fatal(err) }
+	p.(*Platform).pullMessages("pull", "wk1")
+	mu.Lock(); calls := syncCalls; mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("sync calls = %d, want 1", calls)
+	}
+}
+
+func TestPullMessagesSerializesConcurrentCallbacks(t *testing.T) {
+	var mu sync.Mutex
+	active, maxActive := 0, 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			_, _ = w.Write([]byte(`{"errcode":0,"access_token":"access","expires_in":7200}`))
+		case "/cgi-bin/kf/sync_msg":
+			mu.Lock(); active++; if active > maxActive { maxActive = active }; mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock(); active--; mu.Unlock()
+			_, _ = w.Write([]byte(`{"errcode":0,"next_cursor":"done","has_more":false,"msg_list":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	p, err := New(testOptions(api.URL))
+	if err != nil { t.Fatal(err) }
+	platform := p.(*Platform)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); platform.pullMessages("pull", "wk1") }()
+	go func() { defer wg.Done(); platform.pullMessages("pull", "wk1") }()
+	wg.Wait()
+	mu.Lock(); got := maxActive; mu.Unlock()
+	if got != 1 {
+		t.Fatalf("maximum concurrent sync requests = %d, want 1", got)
+	}
+}
