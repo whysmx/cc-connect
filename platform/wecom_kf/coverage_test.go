@@ -286,3 +286,11 @@ func encryptAdapterCoverage(t *testing.T, message []byte, receiveID string, key 
 	return base64.StdEncoding.EncodeToString(out)
 }
 
+
+func TestCoverageDuplicateEmptyAndExpiry(t *testing.T) {
+	p := &Platform{seen: map[string]time.Time{"old": time.Now().Add(-11 * time.Minute)}}
+	if p.duplicate("") { t.Fatal("empty id should not duplicate") }
+	if p.duplicate("fresh") { t.Fatal("fresh id should not duplicate") }
+	if _, ok := p.seen["old"]; ok { t.Fatal("expired id was not evicted") }
+	if !p.duplicate("fresh") { t.Fatal("fresh id should duplicate on second observation") }
+}
