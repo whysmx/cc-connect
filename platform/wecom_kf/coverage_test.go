@@ -108,7 +108,6 @@ func TestCoverageCallbackAllBranches(t *testing.T) {
 	if r := post("<xml><Encrypt>"+echo+"</Encrypt></xml>", "msg_signature=nope&timestamp=10&nonce=n"); r.Code != http.StatusForbidden {
 		t.Fatalf("bad POST signature status=%d", r.Code)
 	}
-	validQuery := "msg_signature=" + sig + "&timestamp=10&nonce=n"
 	badCipherSig := signPlatformTest(p.callbackToken, "10", "n", "bad")
 	if r := post("<xml><Encrypt>bad</Encrypt></xml>", "msg_signature="+badCipherSig+"&timestamp=10&nonce=n"); r.Code != http.StatusBadRequest {
 		t.Fatalf("bad POST decrypt status=%d", r.Code)
