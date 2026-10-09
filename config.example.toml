@@ -1517,6 +1517,59 @@ app_secret = "your-feishu-app-secret"
 # ws_url = "wss://your-wecom-host:port/im_openws?bizid=10001"  # optional / 可选：私有化部署 WebSocket 地址，留空默认公有云 wss://openws.work.weixin.qq.com
 # allow_from = "*"  # Allowed user IDs / 允许的用户 ID
 
+# WeChat Customer Service / 企业微信「微信客服」 (uncomment to enable / 取消注释以启用)
+# Personal WeChat users chat with a customer-service account; cc-connect pulls
+# their messages (kf/sync_msg) and answers via kf/send_msg. See docs/wecom-kf.md.
+# 个人微信用户通过微信客服咨询；cc-connect 拉取消息并通过客服接口回复。详见 docs/wecom-kf.md。
+# - One customer-service account (open_kfid) = one [[projects]] entry.
+#   一个客服账号对应一个项目；新增客服只需复制一段项目配置，无需改代码。
+# - All accounts of a corp share ONE callback URL: use the same listen_addr,
+#   callback_path, corp_id, callback_token and callback_aes_key in every project.
+#   cc-connect opens one listener and routes by open_kfid; duplicate open_kfid
+#   mappings fail at startup.
+#   同一企业的所有客服共用一个回调地址与监听端口，按 open_kfid 分发；重复映射启动即报错。
+# - Read-only Q&A: use the codex agent with mode = "suggest" (read-only sandbox).
+#   仅问答：Codex 使用 mode = "suggest"（只读沙箱）。
+# - Human takeover: when a session is queued for / handled by a human servicer,
+#   the AI neither receives the question nor sends late answers.
+#   人工接管：会话处于待接入/人工接待时，AI 不接收问题，也不发送迟到回复。
+
+# [[projects]]
+# name = "kf-project-1"
+# quiet = true          # WeChat KF allows only 5 messages per customer message; hide progress
+#                       # 微信客服每条客户消息后最多回复 5 条，建议关闭进度消息
+# admin_from = ""       # external_userid list allowed to run privileged commands / 管理员
+#
+# [projects.agent]
+# type = "codex"
+#
+# [projects.agent.options]
+# work_dir = 'D:\AIProjects\project1'
+# backend = "exec"
+# mode = "suggest"
+#
+# [[projects.platforms]]
+# type = "wecom_kf"
+#
+# [projects.platforms.options]
+# corp_id = "YOUR_CORP_ID"
+# corp_secret = "YOUR_WECHAT_KF_SECRET"     # secret of the app allowed to call WeChat KF APIs / 可调用微信客服接口的应用 Secret
+# open_kfid = "YOUR_OPEN_KFID"              # wk... of this customer-service account / 本客服账号 ID
+# callback_token = "YOUR_CALLBACK_TOKEN"
+# callback_aes_key = "YOUR_43_CHAR_ENCODING_AES_KEY"
+# listen_addr = "127.0.0.1:8081"            # default; put an HTTPS reverse proxy in front / 默认值，公网由 HTTPS 反向代理转发
+# callback_path = "/wecom-kf/callback"      # default / 默认值
+# takeover_check = true                     # check service_state before dispatch and reply / 分发与回复前检查会话状态
+# max_replies_per_message = 5               # WeChat KF send limit per customer message / 每条客户消息最多发送条数
+# inbound_media = true                      # pass customer images / voice / video / files to the agent / 把客户图片、语音、视频、文件交给 Agent
+# merge_window_ms = 2000                    # merge a customer's messages sent within this window (e.g. file + question); 0 = off
+#                                           # 合并同一客户在该时间窗内连续发送的消息（如先发文件再提问）；0 关闭
+# welcome_message = ""                      # optional greeting sent when a customer opens the chat (enter_session + welcome_code); empty = off
+#                                           # 可选欢迎语：客户进入会话时发送（需 welcome_code）；留空关闭
+# allow_from = "*"                          # allowed external_userid list / 允许的客户 external_userid
+# api_base_url = "https://qyapi.weixin.qq.com"  # optional / 可选
+# proxy = ""                                # optional forward proxy for API calls / 可选正向代理
+
 # Weixin personal (ilink bot) / 微信个人号（ilink 机器人网关）
 # Same HTTP API as OpenClaw @tencent-weixin/openclaw-weixin: long-poll getUpdates + sendMessage.
 # 与 OpenClaw 插件 openclaw-weixin 使用同一套网关：长轮询收消息 + sendMessage 下发。
