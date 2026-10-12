@@ -376,6 +376,7 @@ enable_markdown = false
 | `callback_path` | ❌ | Webhook 路径（默认 `/wecom/callback`） |
 | `api_base_url` | ❌ | 企业微信 API 基础地址（默认 `https://qyapi.weixin.qq.com`） |
 | `enable_markdown` | ❌ | 是否发送 Markdown 消息（默认 `false`） |
+| `merge_window_ms` | ❌ | 合并同一用户连续回调的时间窗（毫秒，默认 `2000`）；媒体下载未完成时会等待；`0` 关闭。用于「先发文件再问问题」等场景，与 WebSocket 私聊 / wecom_kf 一致 |
 | `proxy` | ❌ | HTTP 正向代理地址（动态 IP 场景使用） |
 
 ### 关于 enable_markdown
