@@ -658,10 +658,19 @@ while (-not (Test-Path $env:CODEX_RELEASE_FILE)) { Start-Sleep -Milliseconds 10 
 	waitForFileLines(t, startsFile, 2)
 }
 
+func TestCodexTurnBusyWaitDefault(t *testing.T) {
+	// Production default must cover real host process-exit lag after
+	// turn.completed (RETEST_FAIL tip 30d9688: 2s was not enough).
+	if defaultCodexTurnBusyWait < 30*time.Second {
+		t.Fatalf("defaultCodexTurnBusyWait = %v, want >= 30s", defaultCodexTurnBusyWait)
+	}
+}
+
 func TestSend_WaitsForPriorTurnToClear(t *testing.T) {
 	// Simulates the EventResult ↔ process-exit race: turn.completed is emitted
 	// while the subprocess still holds turnInFlight briefly, then exits. Send
 	// must wait and succeed rather than drop the queued message.
+	// Override package wait so this test stays fast despite the 30s default.
 	workDir := t.TempDir()
 	binDir := filepath.Join(workDir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {

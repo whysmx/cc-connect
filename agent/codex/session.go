@@ -66,10 +66,14 @@ var codexContextUsageRetryDelay = 50 * time.Millisecond
 var codexContextUsageRetryCount = 4
 
 // Wait/retry when a prior turn's EventResult races process exit: turnInFlight
-// stays true until readLoop finishes cmd.Wait. Engine may Send the next queued
-// message immediately; waiting briefly avoids dropping that message.
-// Overridable in tests.
-var codexTurnBusyWait = 2 * time.Second
+// stays true until readLoop finishes cmd.Wait (stdout drained + process reap).
+// Engine may Send the next queued message right after EventResult; on real
+// hosts (esp. Windows) process exit often takes well over 2s after
+// turn.completed, so the default wait is 30s. Overridable in tests — keep
+// short timeouts there so suites stay fast.
+const defaultCodexTurnBusyWait = 30 * time.Second
+
+var codexTurnBusyWait = defaultCodexTurnBusyWait
 var codexTurnBusyPoll = 25 * time.Millisecond
 
 // errCodexTurnInProgress is returned when a Send cannot acquire the turn lock
@@ -200,6 +204,10 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 // acquireTurnInFlight waits for a prior turn's lock to clear (EventResult can
 // arrive before the subprocess exits), then CAS-sets turnInFlight. True
 // concurrent occupancy still fails after codexTurnBusyWait.
+//
+// We intentionally do not clear turnInFlight on turn.completed/EventResult:
+// each Send is one subprocess, and early unlock would allow a second process
+// to start while the prior is still tearing down (resume / CODEX_HOME races).
 func (cs *codexSession) acquireTurnInFlight() error {
 	if !cs.alive.Load() {
 		return fmt.Errorf("session is closed")
@@ -209,6 +217,7 @@ func (cs *codexSession) acquireTurnInFlight() error {
 	}
 
 	deadline := time.Now().Add(codexTurnBusyWait)
+	waitStart := time.Now()
 	slog.Info("codexSession: waiting for prior turn to finish before Send",
 		"wait", codexTurnBusyWait)
 	poll := codexTurnBusyPoll
@@ -218,6 +227,8 @@ func (cs *codexSession) acquireTurnInFlight() error {
 		}
 		now := time.Now()
 		if !now.Before(deadline) {
+			slog.Warn("codexSession: turn still in progress after wait",
+				"wait", codexTurnBusyWait, "elapsed", time.Since(waitStart))
 			return errCodexTurnInProgress
 		}
 		remaining := deadline.Sub(now)
@@ -234,10 +245,11 @@ func (cs *codexSession) acquireTurnInFlight() error {
 		case <-time.After(sleep):
 		}
 		if cs.turnInFlight.CompareAndSwap(false, true) {
-			slog.Debug("codexSession: acquired turn after wait")
+			slog.Info("codexSession: acquired turn after wait",
+				"elapsed", time.Since(waitStart))
 			return nil
 		}
-		// Mild backoff while still under the overall deadline.
+		// Mild backoff while still under the overall deadline (25–100ms).
 		if poll < 100*time.Millisecond {
 			poll += codexTurnBusyPoll
 		}
