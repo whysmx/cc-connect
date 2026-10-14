@@ -65,6 +65,17 @@ var codexRuntimeConfigTimeout = 1500 * time.Millisecond
 var codexContextUsageRetryDelay = 50 * time.Millisecond
 var codexContextUsageRetryCount = 4
 
+// Wait/retry when a prior turn's EventResult races process exit: turnInFlight
+// stays true until readLoop finishes cmd.Wait. Engine may Send the next queued
+// message immediately; waiting briefly avoids dropping that message.
+// Overridable in tests.
+var codexTurnBusyWait = 2 * time.Second
+var codexTurnBusyPoll = 25 * time.Millisecond
+
+// errCodexTurnInProgress is returned when a Send cannot acquire the turn lock
+// within codexTurnBusyWait (true concurrent occupancy, not a brief race).
+var errCodexTurnInProgress = errors.New("codex session turn already in progress")
+
 func buildCodexPromptPreamble(systemPrompt string, appendPrompt string) string {
 	var sections []string
 	if systemPrompt = strings.TrimSpace(systemPrompt); systemPrompt != "" {
@@ -120,11 +131,8 @@ func newCodexSession(ctx context.Context, cliBin string, cliExtraArgs []string, 
 // If a threadID exists (from a prior turn or resume), uses `codex exec resume <id> <prompt>`.
 // Otherwise uses `codex exec <prompt>` to start a new conversation.
 func (cs *codexSession) Send(prompt string, messageID string, images []core.ImageAttachment, files []core.FileAttachment) error {
-	if !cs.alive.Load() {
-		return fmt.Errorf("session is closed")
-	}
-	if !cs.turnInFlight.CompareAndSwap(false, true) {
-		return fmt.Errorf("codex session turn already in progress")
+	if err := cs.acquireTurnInFlight(); err != nil {
+		return err
 	}
 	// The deferred cleanup reads started when Send returns, so setup failures
 	// release the guard while a launched process keeps it until readLoop exits.
@@ -187,6 +195,53 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 	started = true
 
 	return nil
+}
+
+// acquireTurnInFlight waits for a prior turn's lock to clear (EventResult can
+// arrive before the subprocess exits), then CAS-sets turnInFlight. True
+// concurrent occupancy still fails after codexTurnBusyWait.
+func (cs *codexSession) acquireTurnInFlight() error {
+	if !cs.alive.Load() {
+		return fmt.Errorf("session is closed")
+	}
+	if cs.turnInFlight.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	deadline := time.Now().Add(codexTurnBusyWait)
+	slog.Info("codexSession: waiting for prior turn to finish before Send",
+		"wait", codexTurnBusyWait)
+	poll := codexTurnBusyPoll
+	for {
+		if !cs.alive.Load() {
+			return fmt.Errorf("session is closed")
+		}
+		now := time.Now()
+		if !now.Before(deadline) {
+			return errCodexTurnInProgress
+		}
+		remaining := deadline.Sub(now)
+		sleep := poll
+		if sleep > remaining {
+			sleep = remaining
+		}
+		select {
+		case <-cs.ctx.Done():
+			if !cs.alive.Load() {
+				return fmt.Errorf("session is closed")
+			}
+			return fmt.Errorf("codex session turn wait canceled: %w", cs.ctx.Err())
+		case <-time.After(sleep):
+		}
+		if cs.turnInFlight.CompareAndSwap(false, true) {
+			slog.Debug("codexSession: acquired turn after wait")
+			return nil
+		}
+		// Mild backoff while still under the overall deadline.
+		if poll < 100*time.Millisecond {
+			poll += codexTurnBusyPoll
+		}
+	}
 }
 
 func (cs *codexSession) stageImages(prompt string, images []core.ImageAttachment) (string, []string, error) {
