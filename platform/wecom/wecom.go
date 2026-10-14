@@ -82,6 +82,9 @@ type Platform struct {
 	tokenCache     tokenCache
 	dedup          msgDedup
 	userNameCache  sync.Map // userID -> display name
+	mergeWindow    time.Duration
+	aggMu          sync.Mutex
+	agg            map[string]*httpAggregate
 }
 
 const defaultAPIBaseURL = "https://qyapi.weixin.qq.com"
@@ -183,6 +186,28 @@ func New(opts map[string]any) (core.Platform, error) {
 	allowFrom, _ := opts["allow_from"].(string)
 	core.CheckAllowFrom("wecom", allowFrom)
 
+	mergeWindow := defaultMergeWindow
+	switch v := opts["merge_window_ms"].(type) {
+	case int64:
+		if v <= 0 {
+			mergeWindow = 0
+		} else {
+			mergeWindow = time.Duration(v) * time.Millisecond
+		}
+	case int:
+		if v <= 0 {
+			mergeWindow = 0
+		} else {
+			mergeWindow = time.Duration(v) * time.Millisecond
+		}
+	case float64:
+		if v <= 0 {
+			mergeWindow = 0
+		} else {
+			mergeWindow = time.Duration(v) * time.Millisecond
+		}
+	}
+
 	return &Platform{
 		corpID:         corpID,
 		corpSecret:     corpSecret,
@@ -195,6 +220,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		callbackPath:   path,
 		enableMarkdown: enableMarkdown,
 		apiClient:      apiClient,
+		mergeWindow:    mergeWindow,
+		agg:            make(map[string]*httpAggregate),
 	}, nil
 }
 
@@ -366,7 +393,7 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 	case "text":
 		text := stripWeComAtMentions(msg.Content, p.agentID)
 		slog.Debug("wecom: message received", "user", msg.FromUserName, "text_len", len(text))
-		go p.handler(p, &core.Message{
+		p.emit(&core.Message{
 			SessionKey: sessionKey, Platform: "wecom",
 			MessageID: strconv.FormatInt(msg.MsgId, 10),
 			UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
@@ -375,40 +402,46 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 
 	case "image":
 		slog.Debug("wecom: image received", "user", msg.FromUserName)
+		base := &core.Message{
+			SessionKey: sessionKey, Platform: "wecom",
+			MessageID: strconv.FormatInt(msg.MsgId, 10),
+			UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+			ReplyCtx: rctx,
+		}
+		p.reserve(base)
 		go func() {
 			imgData, err := p.downloadMedia(msg.MediaId)
 			if err != nil {
 				slog.Error("wecom: download image failed", "error", err)
+				p.complete(sessionKey, nil)
 				return
 			}
-			p.handler(p, &core.Message{
-				SessionKey: sessionKey, Platform: "wecom",
-				MessageID: strconv.FormatInt(msg.MsgId, 10),
-				UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
-				Images:   []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
-				ReplyCtx: rctx,
-			})
+			base.Images = []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}}
+			p.complete(sessionKey, base)
 		}()
 
 	case "voice":
 		slog.Debug("wecom: voice received", "user", msg.FromUserName, "format", msg.Format)
+		base := &core.Message{
+			SessionKey: sessionKey, Platform: "wecom",
+			MessageID: strconv.FormatInt(msg.MsgId, 10),
+			UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+			ReplyCtx: rctx,
+		}
+		p.reserve(base)
 		go func() {
 			audioData, err := p.downloadMedia(msg.MediaId)
 			if err != nil {
 				slog.Error("wecom: download voice failed", "error", err)
+				p.complete(sessionKey, nil)
 				return
 			}
 			format := strings.ToLower(msg.Format)
 			if format == "" {
 				format = "amr"
 			}
-			p.handler(p, &core.Message{
-				SessionKey: sessionKey, Platform: "wecom",
-				MessageID: strconv.FormatInt(msg.MsgId, 10),
-				UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
-				Audio:    &core.AudioAttachment{MimeType: "audio/" + format, Data: audioData, Format: format},
-				ReplyCtx: rctx,
-			})
+			base.Audio = &core.AudioAttachment{MimeType: "audio/" + format, Data: audioData, Format: format}
+			p.complete(sessionKey, base)
 		}()
 
 	case "file":
@@ -417,10 +450,18 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 			slog.Warn("wecom: file message missing MediaId")
 			return
 		}
+		base := &core.Message{
+			SessionKey: sessionKey, Platform: "wecom",
+			MessageID: strconv.FormatInt(msg.MsgId, 10),
+			UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
+			ReplyCtx: rctx,
+		}
+		p.reserve(base)
 		go func() {
 			fileData, err := p.downloadMedia(msg.MediaId)
 			if err != nil {
 				slog.Error("wecom: download file failed", "error", err)
+				p.complete(sessionKey, nil)
 				return
 			}
 			baseName := filepath.Base(strings.TrimSpace(msg.FileName))
@@ -428,17 +469,12 @@ func (p *Platform) handleMessage(w http.ResponseWriter, r *http.Request, msgSig,
 				baseName = "attachment"
 			}
 			mt := wecomInboundFileMime(baseName, fileData)
-			p.handler(p, &core.Message{
-				SessionKey: sessionKey, Platform: "wecom",
-				MessageID: strconv.FormatInt(msg.MsgId, 10),
-				UserID:    msg.FromUserName, UserName: p.resolveUserName(msg.FromUserName),
-				Files: []core.FileAttachment{{
-					MimeType: mt,
-					Data:     fileData,
-					FileName: baseName,
-				}},
-				ReplyCtx: rctx,
-			})
+			base.Files = []core.FileAttachment{{
+				MimeType: mt,
+				Data:     fileData,
+				FileName: baseName,
+			}}
+			p.complete(sessionKey, base)
 		}()
 
 	default:
@@ -716,6 +752,7 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 }
 
 func (p *Platform) Stop() error {
+	p.dropAggregates()
 	if p.server != nil {
 		return p.server.Shutdown(context.Background())
 	}

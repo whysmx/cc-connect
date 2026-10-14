@@ -379,6 +379,10 @@ func main() {
 
 		providerWiring := wireAgentProviders(agent, proj.Agent)
 
+		for _, w := range wecomKFDeploymentWarnings(proj) {
+			slog.Warn("wecom_kf deployment check", "project", proj.Name, "warning", w)
+		}
+
 		var platforms []core.Platform
 		for _, pc := range proj.Platforms {
 			opts := make(map[string]any, len(pc.Options)+2)
