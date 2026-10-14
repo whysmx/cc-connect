@@ -591,6 +591,16 @@ func TestSend_RejectsConcurrentTurn(t *testing.T) {
 		t.Fatalf("mkdir bin: %v", err)
 	}
 
+	// Hold the lock longer than the busy wait so a true concurrent Send still fails.
+	oldBusyWait := codexTurnBusyWait
+	oldBusyPoll := codexTurnBusyPoll
+	codexTurnBusyWait = 80 * time.Millisecond
+	codexTurnBusyPoll = 10 * time.Millisecond
+	t.Cleanup(func() {
+		codexTurnBusyWait = oldBusyWait
+		codexTurnBusyPoll = oldBusyPoll
+	})
+
 	startsFile := filepath.Join(workDir, "starts.txt")
 	releaseFile := filepath.Join(workDir, "release")
 	script := "#!/bin/sh\n" +
@@ -621,7 +631,7 @@ while (-not (Test-Path $env:CODEX_RELEASE_FILE)) { Start-Sleep -Milliseconds 10 
 
 	err = cs.Send("steer", "", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "turn already in progress") {
-		t.Fatalf("second Send error = %v, want turn already in progress", err)
+		t.Fatalf("second Send error = %v, want turn already in progress after busy wait", err)
 	}
 
 	data, err := os.ReadFile(startsFile)
@@ -646,6 +656,145 @@ while (-not (Test-Path $env:CODEX_RELEASE_FILE)) { Start-Sleep -Milliseconds 10 
 		t.Fatalf("Send after first process exited: %v", err)
 	}
 	waitForFileLines(t, startsFile, 2)
+}
+
+func TestSend_WaitsForPriorTurnToClear(t *testing.T) {
+	// Simulates the EventResult ↔ process-exit race: turn.completed is emitted
+	// while the subprocess still holds turnInFlight briefly, then exits. Send
+	// must wait and succeed rather than drop the queued message.
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	oldBusyWait := codexTurnBusyWait
+	oldBusyPoll := codexTurnBusyPoll
+	codexTurnBusyWait = 2 * time.Second
+	codexTurnBusyPoll = 10 * time.Millisecond
+	t.Cleanup(func() {
+		codexTurnBusyWait = oldBusyWait
+		codexTurnBusyPoll = oldBusyPoll
+	})
+
+	startsFile := filepath.Join(workDir, "starts.txt")
+	script := "#!/bin/sh\n" +
+		"prompt=$(cat)\n" +
+		"printf '%s\\n' \"$prompt\" >> \"$CODEX_STARTS_FILE\"\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-wait\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n" +
+		"sleep 0.15\n"
+	powershellScript := `
+$prompt = [Console]::In.ReadToEnd()
+[IO.File]::AppendAllText($env:CODEX_STARTS_FILE, $prompt + "` + "`n" + `")
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-wait"}')
+[Console]::Out.WriteLine('{"type":"turn.completed"}')
+Start-Sleep -Milliseconds 150
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+
+	t.Setenv("CODEX_STARTS_FILE", startsFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer func() { _ = cs.Close() }()
+
+	if err := cs.Send("first", "", nil, nil); err != nil {
+		t.Fatalf("Send(first): %v", err)
+	}
+	waitForThreadID(t, cs, "thread-wait")
+	waitForDoneResult(t, cs.Events())
+
+	// Immediately after EventResult, lock may still be held; wait+retry should succeed.
+	started := time.Now()
+	if err := cs.Send("second", "", nil, nil); err != nil {
+		t.Fatalf("Send(second) after brief process linger: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 50*time.Millisecond {
+		t.Logf("Send(second) returned in %v (process may have exited before wait)", elapsed)
+	}
+	waitForFileLines(t, startsFile, 2)
+}
+
+func TestAcquireTurnInFlight_Table(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, cs *codexSession)
+		wait       time.Duration
+		poll       time.Duration
+		wantErr    string
+		clearAfter time.Duration // if >0, clear turnInFlight after this delay
+	}{
+		{
+			name:  "free acquires immediately",
+			setup: func(t *testing.T, cs *codexSession) {},
+			wait:  100 * time.Millisecond,
+			poll:  10 * time.Millisecond,
+		},
+		{
+			name: "clears within wait succeeds",
+			setup: func(t *testing.T, cs *codexSession) {
+				cs.turnInFlight.Store(true)
+			},
+			wait:       500 * time.Millisecond,
+			poll:       10 * time.Millisecond,
+			clearAfter: 40 * time.Millisecond,
+		},
+		{
+			name: "held past wait returns busy",
+			setup: func(t *testing.T, cs *codexSession) {
+				cs.turnInFlight.Store(true)
+			},
+			wait:    60 * time.Millisecond,
+			poll:    10 * time.Millisecond,
+			wantErr: "turn already in progress",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldWait := codexTurnBusyWait
+			oldPoll := codexTurnBusyPoll
+			codexTurnBusyWait = tt.wait
+			codexTurnBusyPoll = tt.poll
+			t.Cleanup(func() {
+				codexTurnBusyWait = oldWait
+				codexTurnBusyPoll = oldPoll
+			})
+
+			cs, err := newCodexSession(context.Background(), "codex", nil, t.TempDir(), "", "", "", "", "", nil, "", "", "")
+			if err != nil {
+				t.Fatalf("newCodexSession: %v", err)
+			}
+			defer func() { _ = cs.Close() }()
+
+			tt.setup(t, cs)
+			if tt.clearAfter > 0 {
+				go func() {
+					time.Sleep(tt.clearAfter)
+					cs.turnInFlight.Store(false)
+				}()
+			}
+
+			err = cs.acquireTurnInFlight()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("acquireTurnInFlight: %v", err)
+				}
+				if !cs.turnInFlight.Load() {
+					t.Fatal("expected turnInFlight set after acquire")
+				}
+				cs.turnInFlight.Store(false)
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
 }
 
 func TestSend_PrependsProjectPromptOnFreshSession(t *testing.T) {
@@ -1056,11 +1205,18 @@ func TestClose_ForceKillsProcessStillRunningAfterTurnCompleted(t *testing.T) {
 
 	oldCloseTimeout := codexSessionCloseTimeout
 	oldForceKillWait := codexSessionForceKillWait
+	oldBusyWait := codexTurnBusyWait
+	oldBusyPoll := codexTurnBusyPoll
 	codexSessionCloseTimeout = 50 * time.Millisecond
 	codexSessionForceKillWait = 500 * time.Millisecond
+	// Process sleeps 30s after turn.completed; short wait must still time out busy.
+	codexTurnBusyWait = 80 * time.Millisecond
+	codexTurnBusyPoll = 10 * time.Millisecond
 	t.Cleanup(func() {
 		codexSessionCloseTimeout = oldCloseTimeout
 		codexSessionForceKillWait = oldForceKillWait
+		codexTurnBusyWait = oldBusyWait
+		codexTurnBusyPoll = oldBusyPoll
 	})
 
 	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
@@ -1075,7 +1231,7 @@ func TestClose_ForceKillsProcessStillRunningAfterTurnCompleted(t *testing.T) {
 	waitForDoneResult(t, cs.Events())
 
 	if err := cs.Send("second", "", nil, nil); err == nil || !strings.Contains(err.Error(), "turn already in progress") {
-		t.Fatalf("Send(second) error = %v, want turn already in progress", err)
+		t.Fatalf("Send(second) error = %v, want turn already in progress after busy wait", err)
 	}
 	waitForFileLines(t, startsFile, 1)
 
