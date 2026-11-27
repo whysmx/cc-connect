@@ -30,6 +30,7 @@ type Platform struct {
 	wsURL                 string // e.g. "ws://127.0.0.1:3001"
 	token                 string // optional access_token
 	allowFrom             string // comma-separated user IDs or "*"
+	requireMention        bool   // group chats: only react when the bot is @-mentioned (default true)
 	shareSessionInChannel bool
 	handler               core.MessageHandler
 	conn                  *websocket.Conn
@@ -40,7 +41,8 @@ type Platform struct {
 	selfID                int64
 	dedup                 core.MessageDedup
 	groupNameCache        sync.Map // groupID -> group name
-	httpURL            string   // OneBot HTTP API URL, e.g. "http://127.0.0.1:3000"
+	httpURL               string   // OneBot HTTP API URL, e.g. "http://127.0.0.1:3000"
+	sendViaHTTP           bool     // route text Send() through httpURL instead of WS (opt-in, default false)
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -52,17 +54,36 @@ func New(opts map[string]any) (core.Platform, error) {
 	allowFrom, _ := opts["allow_from"].(string)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 
+	// require_mention: in group chats only react when the bot is @-mentioned.
+	// Defaults to true (consistent with the feishu platform); set false to
+	// process every group message like earlier versions did.
+	requireMention := true
+	if v, ok := opts["require_mention"].(bool); ok {
+		requireMention = v
+	}
+
 	core.CheckAllowFrom("qq", allowFrom)
 
 	httpURL, _ := opts["http_url"].(string)
 	httpURL = strings.TrimRight(httpURL, "/")
 
+	// send_via_http: send text replies through the OneBot HTTP API instead of
+	// the WebSocket. WS calls share the event readLoop and have a fixed 15s
+	// timeout, which long group replies can exceed (#1474). Opt-in; requires
+	// http_url, otherwise text sends keep using the WebSocket.
+	sendViaHTTP, _ := opts["send_via_http"].(bool)
+	if sendViaHTTP && httpURL == "" {
+		slog.Warn("qq: send_via_http is enabled but http_url is not configured; text messages will be sent over WebSocket")
+	}
+
 	return &Platform{
 		wsURL:                 wsURL,
 		token:                 token,
 		allowFrom:             allowFrom,
+		requireMention:        requireMention,
 		shareSessionInChannel: shareSessionInChannel,
-		httpURL:            httpURL,
+		httpURL:               httpURL,
+		sendViaHTTP:           sendViaHTTP,
 	}, nil
 }
 
@@ -78,11 +99,11 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 
 	conn, _, err := websocket.DefaultDialer.Dial(p.wsURL, header)
 	if err != nil {
-		return fmt.Errorf("qq: ws connect failed (%s): %w", p.wsURL, err)
+		return fmt.Errorf("qq: ws connect failed (%s): %s", core.RedactURL(p.wsURL), core.SafeError(err, p.token))
 	}
 	p.conn = conn
 
-	slog.Info("qq: connected to OneBot", "url", p.wsURL)
+	slog.Info("qq: connected to OneBot", "url", core.RedactURL(p.wsURL))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
@@ -157,7 +178,7 @@ func (p *Platform) reconnect() {
 		}
 		conn, _, err := websocket.DefaultDialer.Dial(p.wsURL, header)
 		if err != nil {
-			slog.Warn("qq: reconnect attempt failed", "attempt", i, "error", err)
+			slog.Warn("qq: reconnect attempt failed", "attempt", i, "error", core.SafeError(err, p.token))
 			continue
 		}
 		p.mu.Lock()
@@ -193,6 +214,11 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	}
 
 	if !p.isAllowed(userID) {
+		return
+	}
+
+	if msgType == "group" && p.requireMention && !p.messageMentionsSelf(payload) {
+		slog.Debug("qq: ignoring group message without bot mention", "group_id", groupID, "user_id", userID)
 		return
 	}
 
@@ -443,6 +469,8 @@ func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) erro
 }
 
 // Send sends a message to the conversation identified by replyCtx.
+// Uses the WebSocket by default; when send_via_http is enabled and http_url
+// is configured, it uses the OneBot HTTP API (see textSendCaller).
 func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
 	rctx, ok := replyCtx.(*replyContext)
 	if !ok {
@@ -452,16 +480,29 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 	params := map[string]any{
 		"message": content,
 	}
+	call := p.textSendCaller()
 
 	if rctx.messageType == "group" {
 		params["group_id"] = rctx.groupID
-		_, err := p.callAPI("send_group_msg", params)
+		_, err := call("send_group_msg", params)
 		return err
 	}
 
 	params["user_id"] = rctx.userID
-	_, err := p.callAPI("send_private_msg", params)
+	_, err := call("send_private_msg", params)
 	return err
+}
+
+// textSendCaller picks the transport for text messages. The WebSocket path
+// has a fixed 15s response timeout shared with inbound event traffic, which
+// long replies can exceed (#1474); the HTTP path has its own connection and a
+// 120s timeout. HTTP is used only when explicitly enabled, so the default
+// behavior is unchanged.
+func (p *Platform) textSendCaller() func(string, map[string]any) (map[string]any, error) {
+	if p.sendViaHTTP && p.httpURL != "" {
+		return p.callHTTPAPI
+	}
+	return p.callAPI
 }
 
 // SendImage sends an image to the conversation.
@@ -668,6 +709,45 @@ func (p *Platform) isAllowed(userID int64) bool {
 	uid := strconv.FormatInt(userID, 10)
 	for _, allowed := range strings.Split(p.allowFrom, ",") {
 		if strings.TrimSpace(allowed) == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// messageMentionsSelf reports whether a OneBot message payload @-mentions the
+// bot itself (or @all). Used to gate group messages when require_mention is on.
+// It fails open (returns true) when the bot's own id is unknown.
+func (p *Platform) messageMentionsSelf(payload map[string]any) bool {
+	if p.selfID == 0 {
+		return true
+	}
+	self := strconv.FormatInt(p.selfID, 10)
+	switch m := payload["message"].(type) {
+	case []any:
+		for _, seg := range m {
+			segMap, ok := seg.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := segMap["type"].(string); t != "at" {
+				continue
+			}
+			data, _ := segMap["data"].(map[string]any)
+			var q string
+			switch v := data["qq"].(type) {
+			case string:
+				q = v
+			case float64:
+				q = strconv.FormatInt(int64(v), 10)
+			}
+			if q == self || q == "all" {
+				return true
+			}
+		}
+	case string:
+		// CQ-code fallback for string-format OneBot implementations.
+		if strings.Contains(m, "[CQ:at,qq="+self+"]") || strings.Contains(m, "[CQ:at,qq=all]") {
 			return true
 		}
 	}

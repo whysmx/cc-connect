@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -22,7 +25,7 @@ func init() {
 	core.RegisterAgent("codex", New)
 }
 
-// Agent drives OpenAI Codex CLI using `codex exec --json`.
+// Agent drives OpenAI Codex CLI through exec or app-server.
 //
 // `codex exec` has no approval IPC, so approvals are not interactive on the
 // exec backend. To get interactive approvals, switch to backend="app_server".
@@ -33,24 +36,31 @@ func init() {
 //   - "full-auto": --sandbox workspace-write + approval_policy=never
 //   - "yolo":      --dangerously-bypass-approvals-and-sandbox
 type Agent struct {
-	workDir         string
-	model           string
-	reasoningEffort string
-	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
-	backend         string // "exec" | "app_server"
-	appServerURL    string
-	codexHome       string
-	systemPrompt    string
-	appendPrompt    string
-	cmd             string   // explicit CLI command; empty enables discovery
-	cliExtraArgs    []string // extra args parsed from cmd after the binary
-	providers       []core.ProviderConfig
-	activeIdx       int      // -1 = no provider set
-	configEnv       []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
-	sessionEnv      []string
-	mu              sync.RWMutex
+	workDir               string
+	model                 string
+	reasoningEffort       string
+	mode                  string // "suggest" | "auto-edit" | "full-auto" | "yolo"
+	backend               string // "exec" | "app_server"
+	appServerURL          string
+	permissionProfile     string
+	codexHome             string
+	systemPrompt          string
+	appendPrompt          string
+	cmd                   string   // explicit CLI command; empty enables discovery
+	cliExtraArgs          []string // extra args parsed from cmd after the binary
+	providers             []core.ProviderConfig
+	activeIdx             int      // -1 = no provider set
+	configEnv             []string // env vars from [projects.agent.options.env] — persists across SetSessionEnv calls
+	sessionEnv            []string
+	ignoreSessionPrefixes []string
+	mu                    sync.RWMutex
+
+	// requestUserInputTimeout is the app_server AskUserQuestion wait
+	// (request_user_input_timeout_mins); always > 0 after New.
+	requestUserInputTimeout time.Duration
 }
 
+// New validates the Codex adapter options and resolves its CLI.
 func New(opts map[string]any) (core.Agent, error) {
 	workDir, _ := opts["work_dir"].(string)
 	if workDir == "" {
@@ -67,6 +77,21 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
 	appServerURL = normalizeAppServerURL(appServerURL)
+
+	var permissionProfile string
+	if raw, exists := opts["permission_profile"]; exists {
+		var ok bool
+		permissionProfile, ok = raw.(string)
+		if !ok || strings.TrimSpace(permissionProfile) == "" {
+			return nil, fmt.Errorf("codex: permission_profile must be a non-empty string")
+		}
+		permissionProfile = strings.TrimSpace(permissionProfile)
+		if backend != "app_server" {
+			return nil, fmt.Errorf("codex: permission_profile requires backend=app_server")
+		}
+	}
+
+	requestUserInputTimeout := parseRequestUserInputTimeoutMins(opts["request_user_input_timeout_mins"])
 
 	cmd, cliExtraArgs := core.ParseCmdOpts(opts, "")
 
@@ -95,20 +120,53 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	return &Agent{
-		workDir:         workDir,
-		model:           model,
-		reasoningEffort: normalizeReasoningEffort(reasoningEffort),
-		mode:            mode,
-		backend:         backend,
-		appServerURL:    appServerURL,
-		codexHome:       strings.TrimSpace(codexHome),
-		systemPrompt:    strings.TrimSpace(systemPrompt),
-		appendPrompt:    strings.TrimSpace(appendPrompt),
-		cmd:             cmd,
-		cliExtraArgs:    cliExtraArgs,
-		configEnv:       configEnv,
-		activeIdx:       -1,
+		workDir:                 workDir,
+		model:                   model,
+		reasoningEffort:         normalizeReasoningEffort(reasoningEffort),
+		mode:                    mode,
+		backend:                 backend,
+		appServerURL:            appServerURL,
+		permissionProfile:       permissionProfile,
+		codexHome:               strings.TrimSpace(codexHome),
+		systemPrompt:            strings.TrimSpace(systemPrompt),
+		appendPrompt:            strings.TrimSpace(appendPrompt),
+		requestUserInputTimeout: requestUserInputTimeout,
+		cmd:                     cmd,
+		cliExtraArgs:            cliExtraArgs,
+		configEnv:               configEnv,
+		ignoreSessionPrefixes:   parseSessionFilterPrefixes(opts["session_filter"]),
+		activeIdx:               -1,
 	}, nil
+}
+
+// parseRequestUserInputTimeoutMins converts request_user_input_timeout_mins
+// into a duration. Unset, non-positive, or unparseable values fall back to
+// defaultRequestUserInputTimeout so existing configs keep the 5-minute wait.
+func parseRequestUserInputTimeoutMins(raw any) time.Duration {
+	if raw == nil {
+		return defaultRequestUserInputTimeout
+	}
+	var mins int64
+	ok := true
+	switch v := raw.(type) {
+	case int:
+		mins = int64(v)
+	case int64:
+		mins = v
+	case float64:
+		mins = int64(v)
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		mins, ok = n, err == nil
+	default:
+		ok = false
+	}
+	if !ok || mins <= 0 || mins > int64(math.MaxInt64/time.Minute) {
+		slog.Warn("codex: invalid request_user_input_timeout_mins, using default",
+			"value_type", fmt.Sprintf("%T", raw), "default_mins", int64(defaultRequestUserInputTimeout/time.Minute))
+		return defaultRequestUserInputTimeout
+	}
+	return time.Duration(mins) * time.Minute
 }
 
 func normalizeBackend(raw string) string {
@@ -225,10 +283,21 @@ func (a *Agent) configuredModels() []core.ModelOption {
 }
 
 func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
-	if models := readCodexModelCatalog(); len(models) > 0 {
-		return models
+	a.mu.RLock()
+	minimaxModels := core.GetMiniMaxProviderModels(a.providers, a.activeIdx)
+	a.mu.RUnlock()
+	if len(minimaxModels) > 0 {
+		return minimaxModels
 	}
 	if models := a.configuredModels(); len(models) > 0 {
+		return models
+	}
+	if models, err := a.loadModelsFromCLI(ctx); err == nil && len(models) > 0 {
+		return models
+	} else if err != nil {
+		slog.Debug("codex: native model discovery failed; using fallback", "error", err)
+	}
+	if models := readCodexModelCatalog(); len(models) > 0 {
 		return models
 	}
 	if models := a.fetchModelsFromAPI(ctx); len(models) > 0 {
@@ -242,10 +311,14 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 
 func defaultCodexModels() []core.ModelOption {
 	return []core.ModelOption{
-		{Name: "gpt-5.6-sol", Desc: "GPT-5.6 Sol (strongest for complex Codex work)"},
+		{Name: "gpt-6.1-sol", Desc: "GPT-6.1 Sol (latest Sol model)"},
+		{Name: "gpt-6-astra", Desc: "GPT-6 Astra"},
+		{Name: "gpt-6-sol", Desc: "GPT-6 Sol"},
+		{Name: "gpt-6-luna", Desc: "GPT-6 Luna"},
+		{Name: "gpt-5.6-sol", Desc: "GPT-5.6 Sol (previous generation)"},
 		{Name: "gpt-5.6-terra", Desc: "GPT-5.6 Terra (balanced everyday Codex work)"},
 		{Name: "gpt-5.6-luna", Desc: "GPT-5.6 Luna (fast, efficient GPT-5.6 model)"},
-		{Name: "gpt-5.6", Desc: "GPT-5.6 (recommended Codex model family default)"},
+		{Name: "gpt-5.6", Desc: "GPT-5.6 (previous model family)"},
 		{Name: "gpt-5.5", Desc: "GPT-5.5 (previous frontier Codex model)"},
 		{Name: "gpt-5.4", Desc: "GPT-5.4 (frontier Codex model)"},
 		{Name: "gpt-5.4-mini", Desc: "GPT-5.4 Mini (fast Codex model)"},
@@ -486,6 +559,7 @@ func (a *Agent) SetSessionEnv(env []string) {
 	a.sessionEnv = env
 }
 
+// StartSession starts or resumes a session using the configured backend and permissions.
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
 	mode := a.mode
@@ -493,9 +567,11 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	reasoningEffort := a.reasoningEffort
 	backend := a.backend
 	appServerURL := a.appServerURL
+	permissionProfile := a.permissionProfile
 	codexHome := a.codexHome
 	systemPrompt := a.systemPrompt
 	appendPrompt := a.appendPrompt
+	requestUserInputTimeout := a.requestUserInputTimeout
 	cliBin := a.cmd
 	cliExtraArgs := a.cliExtraArgs
 	workDir := a.workDir
@@ -526,7 +602,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt, permissionProfile, requestUserInputTimeout)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
@@ -539,15 +615,17 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 	a.mu.RLock()
 	codexHome := a.codexHome
 	workDir := a.workDir
+	ignorePrefixes := append([]string(nil), a.ignoreSessionPrefixes...)
 	a.mu.RUnlock()
-	return listCodexSessions(workDir, codexHome)
+	return listCodexSessions(workDir, codexHome, ignorePrefixes)
 }
 
 func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
 	a.mu.RLock()
 	codexHome := a.codexHome
+	ignorePrefixes := append([]string(nil), a.ignoreSessionPrefixes...)
 	a.mu.RUnlock()
-	return getSessionHistory(sessionID, codexHome, limit)
+	return getSessionHistory(sessionID, codexHome, limit, ignorePrefixes)
 }
 
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
@@ -577,6 +655,7 @@ func (a *Agent) GetMode() string {
 	return a.mode
 }
 
+// WorkspaceAgentOptions preserves backend and permission settings for derived workspaces.
 func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -597,8 +676,14 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.appServerURL != "" {
 		opts["app_server_url"] = a.appServerURL
 	}
+	if a.permissionProfile != "" {
+		opts["permission_profile"] = a.permissionProfile
+	}
 	if a.codexHome != "" {
 		opts["codex_home"] = a.codexHome
+	}
+	if a.requestUserInputTimeout > 0 && a.requestUserInputTimeout != defaultRequestUserInputTimeout {
+		opts["request_user_input_timeout_mins"] = int64(a.requestUserInputTimeout / time.Minute)
 	}
 	return opts
 }

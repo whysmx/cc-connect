@@ -279,6 +279,30 @@ func (a *Agent) GetMode() string {
 	return a.mode
 }
 
+func (a *Agent) WorkspaceAgentOptions() map[string]any {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	opts := map[string]any{
+		"model":        a.model,
+		"mode":         a.mode,
+		"timeout_mins": int64(a.timeout / time.Minute),
+	}
+	if a.cmd != "" {
+		opts["cmd"] = append([]string{a.cmd}, a.cliExtraArgs...)
+	}
+	if len(a.configEnv) > 0 {
+		env := make(map[string]string, len(a.configEnv))
+		for _, entry := range a.configEnv {
+			if key, value, ok := strings.Cut(entry, "="); ok {
+				env[key] = value
+			}
+		}
+		opts["env"] = env
+	}
+	return opts
+}
+
 func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 	return []core.PermissionModeInfo{
 		{Key: "default", Name: "Default", NameZh: "默认", Desc: "Prompt for approval on each tool use", DescZh: "每次工具调用都需要确认"},
@@ -604,4 +628,58 @@ func extractSessionSummary(sf *sessionFile) string {
 		return sf.SessionID[:12] + "..."
 	}
 	return sf.SessionID
+}
+
+// GetSessionHistory reads the saved Gemini conversation for /history after a switch.
+func (a *Agent) GetSessionHistory(ctx context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("gemini: cannot determine home dir: %w", err)
+	}
+	chatsDir := filepath.Join(homeDir, ".gemini", "tmp", geminiProjectSlug(a.GetWorkDir()), "chats")
+	files, err := os.ReadDir(chatsDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gemini: read chats dir: %w", err)
+	}
+
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(chatsDir, file.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			slog.Warn("gemini: skip unreadable session file", "path", path, "error", err)
+			continue
+		}
+		var sf sessionFile
+		if err := json.Unmarshal(data, &sf); err != nil || sf.SessionID != sessionID || sf.Kind == "subagent" {
+			continue
+		}
+		var history []core.HistoryEntry
+		for _, msg := range sf.Messages {
+			role := "assistant"
+			switch msg.Type {
+			case "user":
+				role = "user"
+			case "gemini", "assistant":
+			default:
+				continue
+			}
+			if content := strings.TrimSpace(msg.textContent()); content != "" {
+				history = append(history, core.HistoryEntry{Role: role, Content: content})
+			}
+		}
+		if limit > 0 && len(history) > limit {
+			history = history[len(history)-limit:]
+		}
+		return history, nil
+	}
+	return nil, fmt.Errorf("gemini: session %q not found", sessionID)
 }

@@ -849,9 +849,11 @@ function CCSwitchImportModal({
   onImported: () => void;
   t: (key: string, opts?: any) => string;
 }) {
+  const { i18n } = useTranslation();
   const [providers, setProviders] = useState<CCSwitchProvider[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [importError, setImportError] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState<{ imported: string[]; skipped: string[] } | null>(null);
@@ -864,8 +866,8 @@ function CCSwitchImportModal({
           setError(data.error || t('globalProviders.ccSwitch.notFound'));
         } else {
           setProviders(data.providers || []);
-          const selectable = (data.providers || []).filter(p => !existingNames.has(p.name));
-          setSelected(new Set(selectable.map(p => p.name)));
+          const selectable = (data.providers || []).filter(p => !existingNames.has(p.import_name));
+          setSelected(new Set(selectable.map(p => p.id)));
         }
       } catch {
         setError(t('globalProviders.ccSwitch.notFound'));
@@ -874,23 +876,27 @@ function CCSwitchImportModal({
     })();
   }, []);
 
-  const toggle = (name: string) => {
+  const toggle = (id: string) => {
     setSelected(prev => {
       const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   };
 
   const handleImport = async () => {
+    setImportError('');
     setImporting(true);
     try {
-      const res = await importCCSwitchProviders([...selected]);
+      const res = await importCCSwitchProviders([...selected], i18n.language);
       setResult(res);
       onImported();
-    } catch { /* empty */ }
-    setImporting(false);
+    } catch (e: any) {
+      setImportError(e?.message || String(e));
+    } finally {
+      setImporting(false);
+    }
   };
 
   return (
@@ -902,9 +908,9 @@ function CCSwitchImportModal({
           </div>
         )}
 
-        {error && (
+        {(error || importError) && (
           <div className="rounded-xl border border-amber-200 dark:border-amber-500/20 bg-amber-50 dark:bg-amber-900/10 p-4 text-sm text-amber-700 dark:text-amber-400">
-            {error}
+            {error || importError}
           </div>
         )}
 
@@ -921,24 +927,24 @@ function CCSwitchImportModal({
             </p>
             <div className="max-h-72 overflow-y-auto space-y-1">
               {providers.map(p => {
-                const exists = existingNames.has(p.name);
+                const exists = existingNames.has(p.import_name);
                 return (
                   <label
-                    key={p.name}
+                    key={p.id}
                     className={cn(
                       'flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors cursor-pointer',
                       exists
                         ? 'opacity-50 cursor-not-allowed'
-                        : selected.has(p.name)
+                        : selected.has(p.id)
                           ? 'bg-accent/10 dark:bg-accent/5'
                           : 'hover:bg-gray-50 dark:hover:bg-white/[0.04]',
                     )}
                   >
                     <input
                       type="checkbox"
-                      checked={selected.has(p.name)}
+                      checked={selected.has(p.id)}
                       disabled={exists}
-                      onChange={() => !exists && toggle(p.name)}
+                      onChange={() => !exists && toggle(p.id)}
                       className="rounded border-gray-300 dark:border-white/20 text-accent focus:ring-accent/30"
                     />
                     <div className="flex-1 min-w-0">

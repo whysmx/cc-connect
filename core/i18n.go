@@ -205,6 +205,7 @@ const (
 	MsgSessionCloseFailed        MsgKey = "session_close_failed"
 	MsgSessionResumeUnsafe       MsgKey = "session_resume_unsafe"
 	MsgSessionCancelled          MsgKey = "session_cancelled"
+	MsgThreadWriterConflict      MsgKey = "thread_writer_conflict"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
@@ -216,6 +217,8 @@ const (
 	MsgToolAllowFailed           MsgKey = "tool_allow_failed"
 	MsgToolAllowedNew            MsgKey = "tool_allowed_new"
 	MsgError                     MsgKey = "error"
+	MsgAttachmentUnavailable     MsgKey = "attachment_unavailable"
+	MsgCardRequesterOnly         MsgKey = "card_requester_only"
 	MsgSessionNotFound           MsgKey = "session_not_found"
 	MsgFailedToStartAgentSession MsgKey = "failed_to_start_agent_session"
 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
@@ -255,9 +258,11 @@ const (
 	MsgListSwitchHint            MsgKey = "list_switch_hint"
 	MsgListError                 MsgKey = "list_error"
 	MsgHistoryEmpty              MsgKey = "history_empty"
+	MsgHistoryReadFailed         MsgKey = "history_read_failed"
 	MsgNameUsage                 MsgKey = "name_usage"
 	MsgNameSet                   MsgKey = "name_set"
 	MsgNameNoSession             MsgKey = "name_no_session"
+	MsgCCSwitchAmbiguousProvider MsgKey = "cc_switch_ambiguous_provider"
 	MsgProviderNotSupported      MsgKey = "provider_not_supported"
 	MsgProviderNone              MsgKey = "provider_none"
 	MsgProviderCurrent           MsgKey = "provider_current"
@@ -335,10 +340,13 @@ const (
 	MsgModelCurrent          MsgKey = "model_current"
 	MsgModelChanged          MsgKey = "model_changed"
 	MsgModelChangeFailed     MsgKey = "model_change_failed"
+	MsgModelChangeQueued     MsgKey = "model_change_queued"
 	MsgModelCardSwitching    MsgKey = "model_card_switching"
 	MsgModelCardSwitched     MsgKey = "model_card_switched"
 	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
 	MsgModelNotSupported     MsgKey = "model_not_supported"
+	MsgModelSwitchSession    MsgKey = "model_switch_session"
+	MsgModelSwitchResponse   MsgKey = "model_switch_response"
 	MsgReasoningCurrent      MsgKey = "reasoning_current"
 	MsgReasoningChanged      MsgKey = "reasoning_changed"
 	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
@@ -450,12 +458,14 @@ const (
 	MsgPermCardBody    MsgKey = "perm_card_body"
 	MsgPermCardNote    MsgKey = "perm_card_note"
 
-	MsgAskQuestionTitle     MsgKey = "ask_question_title"
-	MsgAskQuestionNote      MsgKey = "ask_question_note"
-	MsgAskQuestionNoteMulti MsgKey = "ask_question_note_multi"
-	MsgAskQuestionMulti     MsgKey = "ask_question_multi"
-	MsgAskQuestionPrompt    MsgKey = "ask_question_prompt"
-	MsgAskQuestionAnswered  MsgKey = "ask_question_answered"
+	MsgAskQuestionTitle       MsgKey = "ask_question_title"
+	MsgAskQuestionNote        MsgKey = "ask_question_note"
+	MsgAskQuestionNoteMulti   MsgKey = "ask_question_note_multi"
+	MsgAskQuestionMulti       MsgKey = "ask_question_multi"
+	MsgAskQuestionPrompt      MsgKey = "ask_question_prompt"
+	MsgAskQuestionAnswered    MsgKey = "ask_question_answered"
+	MsgAskQuestionStale       MsgKey = "ask_question_stale"
+	MsgAskQuestionCustomInput MsgKey = "ask_question_custom_input"
 
 	MsgCommandsTitle        MsgKey = "commands_title"
 	MsgCommandsEmpty        MsgKey = "commands_empty"
@@ -514,10 +524,13 @@ const (
 	MsgAliasNotFound   MsgKey = "alias_not_found"
 	MsgAliasUsage      MsgKey = "alias_usage"
 
-	MsgNewSessionCreated      MsgKey = "new_session_created"
-	MsgNewSessionCreatedName  MsgKey = "new_session_created_name"
-	MsgSessionAutoResetIdle   MsgKey = "session_auto_reset_idle"
-	MsgSessionClosingGraceful MsgKey = "session_closing_graceful"
+	MsgNewSessionCreated       MsgKey = "new_session_created"
+	MsgNewSessionCreatedName   MsgKey = "new_session_created_name"
+	MsgPreviousTaskStopped     MsgKey = "previous_task_stopped"
+	MsgPreviousTaskUnconfirmed MsgKey = "previous_task_unconfirmed"
+	MsgQueuedMessagesDropped   MsgKey = "queued_messages_dropped"
+	MsgSessionAutoResetIdle    MsgKey = "session_auto_reset_idle"
+	MsgSessionClosingGraceful  MsgKey = "session_closing_graceful"
 
 	MsgDeleteUsage              MsgKey = "delete_usage"
 	MsgDeleteSuccess            MsgKey = "delete_success"
@@ -574,6 +587,7 @@ const (
 	MsgRelaySetupOK       MsgKey = "relay_setup_ok"
 	MsgRelaySetupExists   MsgKey = "relay_setup_exists"
 	MsgRelaySetupNoMemory MsgKey = "relay_setup_no_memory"
+	MsgRelayPartial       MsgKey = "relay_partial_response"
 	MsgSetupNative        MsgKey = "setup_native"
 	MsgCronSetupOK        MsgKey = "cron_setup_ok"
 
@@ -853,6 +867,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "✅ ツール `%s` を事前許可しました。次のセッションから有効になります。",
 		LangSpanish:            "✅ Herramienta `%s` pre-autorizada. Se aplicará en la próxima sesión.",
 	},
+	MsgCardRequesterOnly: {
+		LangEnglish:            "Only the requester can operate this card",
+		LangChinese:            "此卡片仅提问者本人可操作",
+		LangTraditionalChinese: "此卡片僅提問者本人可操作",
+		LangJapanese:           "このカードは質問者本人のみ操作できます",
+		LangSpanish:            "Solo quien hizo la solicitud puede usar esta tarjeta",
+	},
+	MsgAttachmentUnavailable: {
+		LangEnglish:            "Attachment unavailable: %s. The attachment was sent but could not be read.",
+		LangChinese:            "附件无法读取：%s。消息确实带有附件，但本次未能取得文件内容。",
+		LangTraditionalChinese: "附件無法讀取：%s。訊息確實帶有附件，但本次未能取得檔案內容。",
+		LangJapanese:           "添付ファイルを読み取れません：%s。添付ファイルは送信されましたが、内容を取得できませんでした。",
+		LangSpanish:            "Archivo adjunto no disponible: %s. Se envió el archivo, pero no se pudo leer su contenido.",
+	},
 	MsgError: {
 		LangEnglish:            "❌ Error: %v",
 		LangChinese:            "❌ 错误: %v",
@@ -873,6 +901,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⚠️ 會話已過期，請發送 /new 開始新會話",
 		LangJapanese:           "⚠️ セッションが期限切れです。/new で新しい会話を開始してください。",
 		LangSpanish:            "⚠️ Sesión expirada. Usa /new para iniciar una nueva conversación.",
+	},
+	MsgThreadWriterConflict: {
+		LangEnglish:            "This conversation is open in another client. Close it there and retry, or start a new session.",
+		LangChinese:            "此会话正在另一个客户端中打开。请先在那里关闭后重试，或新建会话。",
+		LangTraditionalChinese: "此對話正在另一個用戶端開啟。請先在那裡關閉後重試，或建立新對話。",
+		LangJapanese:           "この会話は別のクライアントで開いています。そちらで閉じて再試行するか、新しいセッションを作成してください。",
+		LangSpanish:            "Esta conversación está abierta en otro cliente. Ciérrala allí y vuelve a intentarlo, o inicia una sesión nueva.",
 	},
 	MsgFailedToStartAgentSession: {
 		LangEnglish:            "❌ Error: failed to start agent session",
@@ -1510,6 +1545,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "現在のセッションに履歴がありません。",
 		LangSpanish:            "No hay historial en la sesión actual.",
 	},
+	MsgHistoryReadFailed: {
+		LangEnglish:            "Failed to read session history.",
+		LangChinese:            "读取会话历史失败。",
+		LangTraditionalChinese: "讀取會話歷史失敗。",
+		LangJapanese:           "セッション履歴の読み取りに失敗しました。",
+		LangSpanish:            "No se pudo leer el historial de la sesión.",
+	},
 	MsgNameUsage: {
 		LangEnglish:            "Usage:\n`/name <text>` — name the current session\n`/name <number> <text>` — name a session by list number",
 		LangChinese:            "用法：\n`/name <名称>` — 命名当前会话\n`/name <序号> <名称>` — 按列表序号命名会话",
@@ -1530,6 +1572,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 沒有活躍會話，請先傳送訊息或切換到一個會話。",
 		LangJapanese:           "❌ アクティブなセッションがありません。メッセージを送信するかセッションに切り替えてください。",
 		LangSpanish:            "❌ No hay sesión activa. Envía un mensaje primero o cambia a una sesión.",
+	},
+	MsgCCSwitchAmbiguousProvider: {
+		LangEnglish:            "ambiguous cc-switch provider name %q: multiple source providers match",
+		LangChinese:            "cc-switch 中的服务商名称 %q 不明确：存在多个同名来源服务商",
+		LangTraditionalChinese: "cc-switch 中的服務商名稱 %q 不明確：存在多個同名來源服務商",
+		LangJapanese:           "cc-switch のプロバイダー名 %q が曖昧です：同名のプロバイダーが複数存在します",
+		LangSpanish:            "El nombre del proveedor de cc-switch %q es ambiguo: coinciden varios proveedores de origen",
 	},
 	MsgProviderNotSupported: {
 		LangEnglish:            "This agent does not support provider switching.",
@@ -2268,6 +2317,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "モデルを `%s` に切り替えました。このセッションと今後のセッションで使用されます。",
 		LangSpanish:            "Modelo cambiado a `%s`. Esta sesión y las futuras usarán este modelo.",
 	},
+	MsgModelChangeQueued: {
+		LangEnglish:            "Model switched to `%s`. A reply is still in progress; the new model takes effect once it finishes.",
+		LangChinese:            "模型已切换为 `%s`。当前回复仍在进行中，新模型将在其完成后生效。",
+		LangTraditionalChinese: "模型已切換為 `%s`。目前回覆仍在進行中，新模型將在其完成後生效。",
+		LangJapanese:           "モデルを `%s` に切り替えました。現在の応答が進行中のため、完了後に新しいモデルが適用されます。",
+		LangSpanish:            "Modelo cambiado a `%s`. Hay una respuesta en curso; el nuevo modelo se aplicará cuando termine.",
+	},
 	MsgModelChangeFailed: {
 		LangEnglish:            "❌ Failed to change model: %v",
 		LangChinese:            "❌ 切换模型失败: %v",
@@ -2288,6 +2344,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "模型已切換為 `%s`。",
 		LangJapanese:           "モデルを `%s` に切り替えました。",
 		LangSpanish:            "Modelo cambiado a `%s`.",
+	},
+	MsgModelSwitchSession: {
+		LangEnglish:            "⚠️ `%[1]s`'s safeguards declined this request%[2]s, so `%[3]s` is answering instead and the rest of this session stays on it. Send `/model %[1]s` to switch back.",
+		LangChinese:            "⚠️ `%[1]s` 的安全机制拦下了这条请求%[2]s，改由 `%[3]s` 回答，本会话后面也会一直用它。发送 `/model %[1]s` 可切回。",
+		LangTraditionalChinese: "⚠️ `%[1]s` 的安全機制攔下了這條請求%[2]s，改由 `%[3]s` 回答，本會話後面也會一直使用它。傳送 `/model %[1]s` 可切回。",
+		LangJapanese:           "⚠️ `%[1]s` のセーフガードがこのリクエストを拒否したため%[2]s、`%[3]s` が代わりに回答しています。このセッションの残りも `%[3]s` のままです。`/model %[1]s` で元に戻せます。",
+		LangSpanish:            "⚠️ Las salvaguardas de `%[1]s` rechazaron esta solicitud%[2]s, así que `%[3]s` responde en su lugar y el resto de esta sesión seguirá con él. Envía `/model %[1]s` para volver.",
+	},
+	MsgModelSwitchResponse: {
+		LangEnglish:            "⚠️ `%[1]s`'s safeguards declined part of this turn%[2]s; `%[3]s` answered that part instead. The session model is unchanged.",
+		LangChinese:            "⚠️ `%[1]s` 的安全机制拦下了本轮的一部分请求%[2]s，那部分改由 `%[3]s` 回答；会话模型不变。",
+		LangTraditionalChinese: "⚠️ `%[1]s` 的安全機制攔下了本輪的一部分請求%[2]s，那部分改由 `%[3]s` 回答；會話模型不變。",
+		LangJapanese:           "⚠️ `%[1]s` のセーフガードがこのターンの一部を拒否したため%[2]s、その部分は `%[3]s` が回答しました。セッションのモデルは変わりません。",
+		LangSpanish:            "⚠️ Las salvaguardas de `%[1]s` rechazaron parte de este turno%[2]s; `%[3]s` respondió esa parte. El modelo de la sesión no cambia.",
 	},
 	MsgModelCardSwitchFailed: {
 		LangEnglish:            "Failed to switch model: %v",
@@ -2529,11 +2599,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Uso: `/model switch <número>` o `/model switch <nombre_modelo>`",
 	},
 	MsgReasoningDefault: {
-		LangEnglish:            "Current reasoning effort: (not set, using Codex default)\n",
-		LangChinese:            "当前推理强度: (未设置，使用 Codex 默认值)\n",
-		LangTraditionalChinese: "當前推理強度: (未設置，使用 Codex 預設值)\n",
-		LangJapanese:           "現在の推論強度: (未設定、Codex のデフォルトを使用)\n",
-		LangSpanish:            "Esfuerzo de razonamiento actual: (no configurado, usando el valor predeterminado de Codex)\n",
+		LangEnglish:            "Current reasoning effort: (not set, using default)\n",
+		LangChinese:            "当前推理强度: (未设置，使用默认值)\n",
+		LangTraditionalChinese: "當前推理強度: (未設定，使用預設值)\n",
+		LangJapanese:           "現在の推論強度: (未設定、デフォルトを使用)\n",
+		LangSpanish:            "Esfuerzo de razonamiento actual: (no configurado, usando el valor predeterminado)\n",
 	},
 	MsgReasoningListTitle: {
 		LangEnglish:            "Available reasoning levels:\n",
@@ -2787,6 +2857,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "カンマ区切りの番号（例: 1,3）で返信するか、直接回答を入力してください",
 		LangSpanish:            "Responda con los números de opción separados por comas (ej. 1,3) o escriba su respuesta",
 	},
+	MsgAskQuestionCustomInput: {
+		LangEnglish:            "Type your custom answer in chat; choosing this option does not submit it.",
+		LangChinese:            "请在聊天中输入自定义回答；选择此项不会直接提交。",
+		LangTraditionalChinese: "請在聊天中輸入自訂回答；選擇此項不會直接提交。",
+		LangJapanese:           "カスタム回答をチャットに入力してください。この選択肢だけでは送信されません。",
+		LangSpanish:            "Escriba su respuesta personalizada en el chat; elegir esta opción no la envía.",
+	},
 	MsgAskQuestionMulti: {
 		LangEnglish:            " (multiple selections allowed, separate with commas)",
 		LangChinese:            "（可多选，用逗号分隔）",
@@ -2807,6 +2884,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "已回答",
 		LangJapanese:           "回答済み",
 		LangSpanish:            "Respondido",
+	},
+	MsgAskQuestionStale: {
+		LangEnglish:            "⚠️ That question was already answered or is no longer active, so this answer was not sent to the agent.",
+		LangChinese:            "⚠️ 这个问题已经回答过了或已失效，这次的回答没有发给 agent。",
+		LangTraditionalChinese: "⚠️ 這個問題已經回答過了或已失效，這次的回答沒有發給 agent。",
+		LangJapanese:           "⚠️ この質問は回答済みか無効になっているため、この回答はエージェントに送信されませんでした。",
+		LangSpanish:            "⚠️ Esa pregunta ya se respondió o ya no está activa, así que esta respuesta no se envió al agente.",
 	},
 	MsgCommandsTitle: {
 		LangEnglish:            "🔧 **Custom Commands** (%d)\n\n",
@@ -3209,6 +3293,27 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "✅ 新しいセッションを作成しました：**%s**",
 		LangSpanish:            "✅ Nueva sesión creada: **%s**",
 	},
+	MsgPreviousTaskStopped: {
+		LangEnglish:            "Previous task stopped during session reset.",
+		LangChinese:            "重置会话时已停止上一项任务。",
+		LangTraditionalChinese: "重設對話時已停止上一項任務。",
+		LangJapanese:           "セッションのリセット時に前のタスクを停止しました。",
+		LangSpanish:            "La tarea anterior se detuvo al reiniciar la sesión.",
+	},
+	MsgPreviousTaskUnconfirmed: {
+		LangEnglish:            "The previous task's process could not be confirmed stopped; check the separate close warning.",
+		LangChinese:            "无法确认上一项任务的进程已停止；请查看单独的关闭警告。",
+		LangTraditionalChinese: "無法確認上一項任務的程序已停止；請查看另行顯示的關閉警告。",
+		LangJapanese:           "前のタスクのプロセスが停止したことを確認できません。別途表示された終了警告を確認してください。",
+		LangSpanish:            "No se pudo confirmar que el proceso anterior se detuviera; revisa el aviso de cierre por separado.",
+	},
+	MsgQueuedMessagesDropped: {
+		LangEnglish:            "%d queued message(s) dropped during session reset.",
+		LangChinese:            "重置会话时丢弃了 %d 条排队消息。",
+		LangTraditionalChinese: "重設對話時捨棄了 %d 則佇列訊息。",
+		LangJapanese:           "セッションのリセット時にキュー内のメッセージ %d 件を破棄しました。",
+		LangSpanish:            "Se descartaron %d mensajes en cola al reiniciar la sesión.",
+	},
 	MsgSessionAutoResetIdle: {
 		LangEnglish:            "⏰ Session auto-reset after %d minute(s) of inactivity.",
 		LangChinese:            "⏰ 因空闲超过 %d 分钟，已自动切换到新会话。",
@@ -3475,6 +3580,13 @@ var messages = map[MsgKey]map[Language]string{
 	MsgRelayBound: {
 		LangEnglish: "Current relay binding: %s",
 		LangChinese: "当前中继绑定: %s",
+	},
+	MsgRelayPartial: {
+		LangEnglish:            "⏳ The other bot is still working — this relay timed out before it produced a final answer.\n\nPartial output so far:\n---\n%s",
+		LangChinese:            "⏳ 对方仍在运行 —— 本次中继在它给出最终结果前超时了。\n\n目前的片段输出：\n---\n%s",
+		LangTraditionalChinese: "⏳ 對方仍在執行 —— 本次中繼在它給出最終結果前逾時了。\n\n目前的片段輸出：\n---\n%s",
+		LangJapanese:           "⏳ 相手はまだ実行中です —— 最終結果が出る前に中継がタイムアウトしました。\n\n現時点の部分的な出力：\n---\n%s",
+		LangSpanish:            "⏳ El otro bot sigue trabajando: este relay agotó el tiempo antes de dar una respuesta final.\n\nSalida parcial hasta ahora:\n---\n%s",
 	},
 	MsgRelayUsage: {
 		LangEnglish: "Usage:\n  /bind <project>  — bind with another bot in this group\n  /bind remove     — remove binding\n  /bind            — show current binding\n\n<project> is the project name from config.toml [[projects]].",

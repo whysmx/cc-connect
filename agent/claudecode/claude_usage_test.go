@@ -3,10 +3,37 @@ package claudecode
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestClaudeUsageResetErrorOmitsRawInput(t *testing.T) {
+	const sentinel = "SENTINEL_RESET_LABEL_CONTENT"
+	_, err := parseClaudeUsageResetTime(sentinel, time.Now())
+	if err == nil || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("unsafe usage reset error: %v", err)
+	}
+}
+
+func TestPromptActionForScreen_Claude2336FolderTrust(t *testing.T) {
+	const prompt = "Quick safety check: Is this a project you created or one you trust?\n"
+	const footer = "Enter to confirm · Esc to cancel"
+	for _, tc := range []struct {
+		name, screen, want string
+	}{
+		{"no selected in 2.1.330", prompt + "❯ No, exit\n  Yes, I trust this folder\n" + footer, "\x1b[B\r"},
+		{"yes selected", prompt + "  No, exit\n❯ Yes, I trust this folder\n" + footer, "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := promptActionForScreen(tc.screen); got != tc.want {
+				t.Fatalf("promptActionForScreen() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestSanitizeClaudeUsageOutput_RendersCursorMoves(t *testing.T) {
 	raw := "" +
@@ -127,6 +154,43 @@ func TestParseClaudeUsageReport_UpgradeRequired(t *testing.T) {
 	_, err := parseClaudeUsageReport(text, time.Now())
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "upgrade") {
 		t.Fatalf("err = %v, want upgrade guidance", err)
+	}
+}
+
+// When Claude Code cannot load usage data, its /usage panel shows an error
+// instead of the usage bars. The probe used to keep waiting for bars that never
+// appear and failed with a generic timeout; it must report the error right away.
+func TestDetectClaudeUsageOutputError_FailedToLoadUsageData(t *testing.T) {
+	// The panel as rendered by Claude Code 2.1.318 when its usage request fails.
+	screen := strings.TrimSpace(`
+Settings Status Config Usage Stats
+
+Session
+
+Total cost: $0.0000
+Total duration (API): 0s
+Total duration (wall): 5s
+Total code changes: 0 lines added, 0 lines removed
+Usage: 0 input, 0 output, 0 cache read, 0 cache write
+
+Error: Failed to load usage data
+
+r to retry · Esc to cancel
+`)
+
+	err := detectClaudeUsageOutputError(screen, "")
+	if err == nil || !strings.Contains(err.Error(), "Failed to load usage data") {
+		t.Fatalf("err = %v, want the failed-to-load error", err)
+	}
+	if _, err := parseClaudeUsageReport(screen, time.Now()); err == nil || !strings.Contains(err.Error(), "could not load usage data") {
+		t.Fatalf("parseClaudeUsageReport err = %v, want the failed-to-load error", err)
+	}
+
+	// If the usage bars did render, an error elsewhere on the panel must not
+	// hide them.
+	withBars := screen + "\n\nCurrent session\n19% used\nResets 7:20pm (UTC)\n\nCurrent week (all models)\n16% used\nResets Nov 21, 11am (UTC)"
+	if err := detectClaudeUsageOutputError(withBars, ""); err != nil {
+		t.Fatalf("err = %v, want nil when usage bars are present", err)
 	}
 }
 
@@ -268,4 +332,39 @@ func mustLoadLocation(t *testing.T, name string) *time.Location {
 		t.Fatalf("LoadLocation(%q): %v", name, err)
 	}
 	return loc
+}
+
+// A probe whose PTY reader finishes before the process exits must still return.
+// The reader's single send on readDone used to be consumed by the main loop,
+// leaving the deferred cleanup blocked on a second receive forever (#2015).
+func TestRunClaudeUsageProbe_ReturnsWhenReaderFinishesFirst(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell script as a fake claude binary")
+	}
+	binDir := t.TempDir()
+	// Close every descriptor that refers to the PTY, then keep running, so the
+	// reader sees the end of the PTY while the process is still alive.
+	script := "#!/bin/sh\nexec </dev/null >/dev/null 2>/dev/null\nsleep 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&Agent{}).runClaudeUsageProbe(ctx)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from a probe whose output ended before /usage rendered")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runClaudeUsageProbe did not return after the PTY reader finished")
+	}
 }
