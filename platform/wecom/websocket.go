@@ -330,8 +330,8 @@ func (p *WSPlatform) runConnection() error {
 			return fmt.Errorf("read: %w", err)
 		}
 
-		var frame wsFrame
-		if err := json.Unmarshal(raw, &frame); err != nil {
+		frame, err := unmarshalWSFrame(raw)
+		if err != nil {
 			slog.Warn("wecom-ws: invalid json", "error", err)
 			continue
 		}
