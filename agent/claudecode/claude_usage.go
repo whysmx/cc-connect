@@ -46,6 +46,26 @@ type claudeUsageProbeState struct {
 	usageSentAt     time.Time
 }
 
+// lockedBuffer is a bytes.Buffer that can be written by os/exec's stderr copier goroutine
+// while the probe loop reads it. A plain bytes.Buffer is a data race there, and -race
+// reports it in TestRunClaudeUsageProbe_ReturnsWhenReaderFinishesFirst.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func (a *Agent) GetUsage(ctx context.Context) (*core.UsageReport, error) {
 	if _, err := exec.LookPath("claude"); err != nil {
 		return nil, fmt.Errorf("claudecode: 'claude' CLI not found in PATH")
@@ -84,7 +104,7 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 	}
 	cmd.Env = env
 
-	var stderr bytes.Buffer
+	var stderr lockedBuffer
 	cmd.Stderr = &stderr
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})
@@ -100,8 +120,13 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 	}()
 
 	terminal := newClaudeUsageTerminal()
+	// readDone carries the reader's single result and may be consumed by the
+	// loop below; readerExited is closed when the reader returns, so cleanup can
+	// wait on it no matter who received from readDone.
 	readDone := make(chan error, 1)
+	readerExited := make(chan struct{})
 	go func() {
+		defer close(readerExited)
 		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
@@ -125,7 +150,7 @@ func (a *Agent) runClaudeUsageProbe(ctx context.Context) (string, error) {
 		}
 		cancel()
 		// Wait for reader goroutine to finish so it is never leaked.
-		<-readDone
+		<-readerExited
 		select {
 		case <-processDone:
 		case <-time.After(2 * time.Second):
@@ -254,6 +279,11 @@ func promptActionForScreen(screen string) string {
 		return ""
 	}
 	if strings.Contains(lower, "quick safety check") || strings.Contains(lower, "yes, i trust this folder") {
+		for _, line := range strings.Split(lower, "\n") {
+			if strings.Contains(line, "❯") && strings.Contains(line, "no, exit") {
+				return "\x1b[B\r"
+			}
+		}
 		return "\r"
 	}
 	if (strings.Contains(lower, "telemetry") || strings.Contains(lower, "help improve") || strings.Contains(lower, "usage data")) &&
@@ -434,7 +464,7 @@ func parseClaudeUsageResetTime(raw string, now time.Time) (time.Time, error) {
 		return resetAt, nil
 	}
 
-	return time.Time{}, fmt.Errorf("unsupported reset time %q", raw)
+	return time.Time{}, fmt.Errorf("unsupported reset time (chars=%d)", len([]rune(raw)))
 }
 
 func detectClaudeUsageOutputError(screen, stderr string) error {
@@ -448,6 +478,10 @@ func detectClaudeUsageOutputError(screen, stderr string) error {
 		return fmt.Errorf("claudecode: Claude Code is not logged in for /usage; run `claude auth login`")
 	case strings.Contains(joined, "/usage") && (strings.Contains(joined, "not available") || strings.Contains(joined, "not supported") || strings.Contains(joined, "subscription")):
 		return fmt.Errorf("claudecode: current Claude account does not support /usage")
+	case strings.Contains(joined, "failed to load usage data") && !claudeUsagePercentRe.MatchString(joined):
+		// Claude Code's own usage request failed and the panel shows an error
+		// instead of the usage bars, which will not appear on this screen.
+		return fmt.Errorf("claudecode: Claude Code could not load usage data (its /usage panel shows \"Failed to load usage data\")")
 	default:
 		return nil
 	}

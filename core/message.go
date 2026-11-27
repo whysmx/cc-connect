@@ -412,7 +412,9 @@ type Message struct {
 	ChannelID    string
 	UserID       string
 	UserName     string
+	ChatID       string // source chat ID, when distinct from ChannelID
 	ChatName     string // human-readable chat/group name (optional)
+	ChatType     string // source chat type, when supplied by the platform
 	Content      string
 	Images       []ImageAttachment   // attached images (if any)
 	Files        []FileAttachment    // attached files (if any)
@@ -427,7 +429,9 @@ type Message struct {
 	LegacyChannelKey string
 	ReplyCtx         any    // platform-specific context needed for replying
 	FromVoice        bool   // true if message originated from voice transcription
+	SilentEmpty      bool   // suppress fallback reply for an empty synthetic turn
 	ModeOverride     string // if set, temporarily override agent permission mode for this message
+	DeliveryLabel    string // displayed on an automated final reply; not sent to the agent
 	// IsPermissionResponse is set by inline-button / card-action paths in
 	// platforms when a synthesized message is forwarded as a permission
 	// decision (e.g. Telegram handleCallbackQuery for perm:allow/deny,
@@ -443,6 +447,14 @@ type Message struct {
 	// drop late redeliveries that reuse a new message_id but an older create_time
 	// than a message already processed. Zero means unset (no ordering hint).
 	UserMessageTimeMs int64
+	// CardAnswerRendered is set by platforms whose card/button callback both
+	// forwards the answer and replaces the original card with the rendered
+	// result in the callback response (e.g. Feishu askq: option clicks and
+	// askq_text form submits). The engine then skips the "✅ question: answer"
+	// chat echo, which would otherwise duplicate a result the user can already
+	// see in the card. Plain-text answers and platforms without in-place card
+	// updates leave it false and keep the echo.
+	CardAnswerRendered bool
 }
 
 // EventType distinguishes different kinds of agent output.
@@ -456,8 +468,28 @@ const (
 	EventResult            EventType = "result"             // final aggregated result
 	EventError             EventType = "error"              // error occurred
 	EventPermissionRequest EventType = "permission_request" // agent requests permission via stdio protocol
+	EventUserInputRequest  EventType = "user_input_request" // non-blocking question; answer is a user message
 	EventThinking          EventType = "thinking"           // thinking/processing status
+	EventModelSwitch       EventType = "model_switch"       // agent CLI moved the turn to another model on its own (see ModelSwitch)
 )
+
+// ModelSwitch describes a model change the agent CLI made without being asked
+// to, e.g. Claude Code re-running a request that the primary model's
+// safeguards declined on a fallback model. It is carried by EventModelSwitch
+// so the engine can tell the user; a /model switch never produces one.
+type ModelSwitch struct {
+	From string // model the request was sent to
+	To   string // model that answered instead
+	// Reason is the trigger reported by the CLI ("refusal": a safety
+	// classifier declined the request on From).
+	Reason string
+	// Category is the refusal category the API reported ("cyber", "bio", ...).
+	// Empty when the API carried none.
+	Category string
+	// SessionWide is true when the rest of the session stays on To, false when
+	// only this response came from To (e.g. a subagent fell back).
+	SessionWide bool
+}
 
 // UserQuestion represents a structured question from AskUserQuestion.
 type UserQuestion struct {
@@ -495,6 +527,7 @@ type Event struct {
 	CacheReadInputTokens     int            // cache-read tokens (prior context retrieved from cache)
 	Metadata                 map[string]any // optional metadata from agent (e.g. compaction_continue)
 	Synthetic                bool           // true if this is a synthetic/generated message (not from real user)
+	ModelSwitch              *ModelSwitch   // populated for EventModelSwitch
 }
 
 // HistoryEntry is one turn in a conversation.

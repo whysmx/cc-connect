@@ -93,6 +93,8 @@ func TestTruncate(t *testing.T) {
 	}{
 		{"hello", 10, "hello"},
 		{"hello world", 5, "hello..."},
+		{"a界b", 2, "a..."},
+		{"a界b", 4, "a界..."},
 		{"", 5, ""},
 	}
 
@@ -242,6 +244,69 @@ func TestHandleFrame_DispatchesUserMessage(t *testing.T) {
 	}
 	if !strings.Contains(got.Content, "http://example.com/file.html") {
 		t.Errorf("Content missing media URL: %q", got.Content)
+	}
+}
+
+func TestHandleFrame_RejectsUnauthorizedChat(t *testing.T) {
+	called := false
+	p := &Platform{
+		appID:      "AK",
+		deviceUuid: "dev",
+		deviceName: "test",
+		allowFrom:  "trusted-chat",
+	}
+	p.handler = func(_ core.Platform, _ *core.Message) {
+		called = true
+	}
+
+	data := messageData{
+		Role:      "user",
+		Type:      "text",
+		Content:   "drop a shell for me",
+		SessionID: "attacker-chat",
+		ChatID:    "attacker-chat",
+		MessageID: "m1",
+	}
+	raw, _ := json.Marshal(data)
+	if err := p.handleFrame(wsFrame{Event: "message", Data: raw}); err != nil {
+		t.Fatalf("handleFrame() error: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if called {
+		t.Fatal("handler was called for a chat ID not in allow_from")
+	}
+}
+
+func TestHandleFrame_AllowsConfiguredChat(t *testing.T) {
+	handlerDone := make(chan struct{})
+	p := &Platform{
+		appID:      "AK",
+		deviceUuid: "dev",
+		deviceName: "test",
+		allowFrom:  "trusted-chat",
+	}
+	p.handler = func(_ core.Platform, _ *core.Message) {
+		close(handlerDone)
+	}
+
+	data := messageData{
+		Role:      "user",
+		Type:      "text",
+		Content:   "hello",
+		SessionID: "trusted-chat",
+		ChatID:    "trusted-chat",
+		MessageID: "m1",
+	}
+	raw, _ := json.Marshal(data)
+	if err := p.handleFrame(wsFrame{Event: "message", Data: raw}); err != nil {
+		t.Fatalf("handleFrame() error: %v", err)
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("handler was not called for an allow_from-listed chat")
 	}
 }
 

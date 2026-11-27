@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -110,7 +111,6 @@ func TestOpencodeSessionBuildRunArgsIncludesImagesAsFiles(t *testing.T) {
 		"run", "--format", "json",
 		"--session", "ses_123",
 		"--model", "provider/model",
-		"--dir", "/repo",
 		"--thinking",
 		"--file", "/tmp/a.png",
 		"--file", "/tmp/b.jpg",
@@ -118,6 +118,144 @@ func TestOpencodeSessionBuildRunArgsIncludesImagesAsFiles(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
+}
+
+// opencode v2's `run` rejects --dir, so the work dir must only reach opencode
+// as the process cwd (#2076).
+func TestOpencodeSessionBuildRunArgsOmitsDirFlag(t *testing.T) {
+	s := &opencodeSession{workDir: "/repo"}
+
+	for _, arg := range s.buildRunArgs("hi", nil, "") {
+		if arg == "--dir" || strings.HasPrefix(arg, "--dir=") {
+			t.Fatalf("buildRunArgs passed %q to opencode run", arg)
+		}
+	}
+}
+
+// TestOpencodeSessionSendRunsInWorkDir verifies that the opencode process is
+// actually started in the configured work_dir now that `--dir` is no longer
+// passed on the command line (#2076). Without this check, dropping the flag
+// could silently drop the work dir as well. opencode resolves its project
+// directory from $PWD, so the child's PWD must be the work dir too, even when
+// cc-connect itself runs elsewhere.
+//
+// The test binary doubles as a fake opencode: when GO_WANT_OPENCODE_HELPER=1
+// is set it records its working directory and $PWD, then exits.
+func TestOpencodeSessionSendRunsInWorkDir(t *testing.T) {
+	if os.Getenv("GO_WANT_OPENCODE_HELPER") == "1" {
+		cwdFile := os.Getenv("CC_OPENCODE_CWD_FILE")
+		if cwdFile == "" {
+			os.Exit(2)
+		}
+		wd, err := os.Getwd()
+		if err != nil {
+			os.Exit(2)
+		}
+		record := wd + "\n" + os.Getenv("PWD")
+		if err := os.WriteFile(cwdFile, []byte(record), 0o600); err != nil {
+			os.Exit(2)
+		}
+		_, _ = os.Stdout.WriteString(`{"type":"text","part":{"text":"cwd recorded"}}` + "\n")
+		_, _ = os.Stdout.WriteString(`{"type":"step_finish","part":{"reason":"stop"}}` + "\n")
+		os.Exit(0)
+	}
+
+	cwdFile := filepath.Join(t.TempDir(), "cwd.txt")
+	workDir := t.TempDir()
+	// cc-connect's own $PWD points elsewhere, as when it serves several
+	// work dirs; the child must not inherit it.
+	t.Setenv("PWD", t.TempDir())
+
+	s, err := newOpencodeSession(
+		context.Background(),
+		os.Args[0],
+		[]string{"-test.run=TestOpencodeSessionSendRunsInWorkDir", "--"},
+		workDir,
+		"",
+		"default",
+		"",
+		"",
+		[]string{
+			"GO_WANT_OPENCODE_HELPER=1",
+			"CC_OPENCODE_CWD_FILE=" + cwdFile,
+		},
+	)
+	if err != nil {
+		t.Fatalf("newOpencodeSession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(30 * time.Second)
+wait:
+	for {
+		select {
+		case evt := <-s.Events():
+			if evt.Type == core.EventResult {
+				break wait
+			}
+		case <-timeout:
+			t.Fatal("timeout waiting for the fake opencode process to finish")
+		}
+	}
+
+	raw, err := os.ReadFile(cwdFile)
+	if err != nil {
+		t.Fatalf("read recorded cwd: %v", err)
+	}
+	gotCwd, gotPWD, _ := strings.Cut(strings.TrimSpace(string(raw)), "\n")
+	want, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		t.Fatalf("resolve work dir: %v", err)
+	}
+	for name, recorded := range map[string]string{"cwd": gotCwd, "$PWD": gotPWD} {
+		got, err := filepath.EvalSymlinks(recorded)
+		if err != nil {
+			t.Fatalf("resolve recorded %s %q: %v", name, recorded, err)
+		}
+		if got != want {
+			t.Fatalf("opencode process %s = %q, want work_dir %q", name, got, want)
+		}
+	}
+}
+
+func TestOpencodeRunEnvSetsPWDToWorkDir(t *testing.T) {
+	t.Setenv("PWD", "/cc-connect/cwd")
+
+	env := opencodeRunEnv("/repo", []string{"FOO=bar", "PWD=/from/extra"})
+	if got := envValues(env, "PWD"); !reflect.DeepEqual(got, []string{"/repo"}) {
+		t.Fatalf("PWD = %q, want [\"/repo\"]", got)
+	}
+	if got := envValues(env, "FOO"); !reflect.DeepEqual(got, []string{"bar"}) {
+		t.Fatalf("FOO = %q, want [\"bar\"]", got)
+	}
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env = opencodeRunEnv("rel", nil)
+	if got, want := envValues(env, "PWD"), []string{filepath.Join(wd, "rel")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("relative work dir: PWD = %q, want %q", got, want)
+	}
+
+	env = opencodeRunEnv("", nil)
+	if got := envValues(env, "PWD"); !reflect.DeepEqual(got, []string{"/cc-connect/cwd"}) {
+		t.Fatalf("empty work dir: PWD = %q, want inherited", got)
+	}
+}
+
+func envValues(env []string, key string) []string {
+	var values []string
+	for _, e := range env {
+		if k, v, ok := strings.Cut(e, "="); ok && k == key {
+			values = append(values, v)
+		}
+	}
+	return values
 }
 
 // TestHandleStepStart_SessionIDFromTopLevel verifies that handleStepStart
@@ -170,6 +308,7 @@ func TestHandleStepStopSendsEventResult(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &opencodeSession{events: make(chan core.Event, 1), ctx: ctx}
+	s.textSent.Store(true)
 	s.handleStepFinish(raw)
 
 	select {
@@ -226,6 +365,7 @@ func TestHandleStepDuplicateEventResultPrevented(t *testing.T) {
 		ctx:        ctx,
 		resultSent: atomic.Bool{},
 	}
+	s.textSent.Store(true)
 
 	s.handleStepFinish(raw)
 	s.handleStepFinish(raw)
@@ -278,6 +418,30 @@ func TestHandleToolUsePermissionDeniedEmitsEventText(t *testing.T) {
 	}
 	if !strings.Contains(events[1].Content, "rejected permission") {
 		t.Errorf("EventText.Content = %q, want it to contain the rejection reason", events[1].Content)
+	}
+}
+
+func TestExtractToolInput_PreservesStructuredParameters(t *testing.T) {
+	input := extractToolInput(map[string]any{
+		"title": "include",
+		"input": map[string]any{
+			"pattern": "foo",
+			"include": "*.go",
+			"path":    "platform/feishu",
+		},
+	})
+	var got map[string]any
+	if err := json.Unmarshal([]byte(input), &got); err != nil {
+		t.Fatalf("extractToolInput returned invalid JSON: %q: %v", input, err)
+	}
+	for key, want := range map[string]string{
+		"pattern": "foo",
+		"include": "*.go",
+		"path":    "platform/feishu",
+	} {
+		if got[key] != want {
+			t.Errorf("parameter %s = %v, want %q", key, got[key], want)
+		}
 	}
 }
 

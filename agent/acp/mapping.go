@@ -15,7 +15,7 @@ func mapSessionUpdate(sessionID string, params json.RawMessage) []core.Event {
 		Update    json.RawMessage `json:"update"`
 	}
 	if err := json.Unmarshal(params, &wrap); err != nil || len(wrap.Update) == 0 {
-		slog.Debug("acp: mapSessionUpdate: failed to parse wrap", "error", err, "params", string(params))
+		slog.Debug("acp: mapSessionUpdate: failed to parse wrap", "error", err, "params_bytes", len(params))
 		return nil
 	}
 	sid := wrap.SessionID
@@ -27,7 +27,7 @@ func mapSessionUpdate(sessionID string, params json.RawMessage) []core.Event {
 		SessionUpdate string `json:"sessionUpdate"`
 	}
 	if err := json.Unmarshal(wrap.Update, &head); err != nil {
-		slog.Debug("acp: mapSessionUpdate: failed to parse head", "error", err, "update", string(wrap.Update))
+		slog.Debug("acp: mapSessionUpdate: failed to parse head", "error", err, "update_bytes", len(wrap.Update))
 		return nil
 	}
 
@@ -42,6 +42,10 @@ func mapSessionUpdate(sessionID string, params json.RawMessage) []core.Event {
 		return mapPlan(sid, wrap.Update)
 	case "user_message_chunk":
 		// History replay during session/load — suppress to avoid echoing user input.
+		return nil
+	case "usage_update":
+		// Context token accounting; cached on the session for
+		// GetContextUsage (see maybeAbsorbUsageUpdate), never rendered.
 		return nil
 	default:
 		// Optional vendor / future ACP shapes — best-effort text extraction.
@@ -110,7 +114,7 @@ func mapAgentMessageChunk(sessionID string, update json.RawMessage) []core.Event
 	}
 
 	// Log unknown format for debugging
-	slog.Debug("acp: mapAgentMessageChunk: unknown format", "update", string(update))
+	slog.Debug("acp: mapAgentMessageChunk: unknown format", "update_bytes", len(update))
 	return nil
 }
 
@@ -146,10 +150,9 @@ func mapToolCall(sessionID string, update json.RawMessage) []core.Event {
 
 func mapToolCallUpdate(sessionID string, update json.RawMessage) []core.Event {
 	var u struct {
-		Title      string `json:"title"`
-		ToolCallID string `json:"toolCallId"`
-		Status     string `json:"status"`
-		Content    []struct {
+		Title   string `json:"title"`
+		Status  string `json:"status"`
+		Content []struct {
 			Type    string `json:"type"`
 			Content struct {
 				Type string `json:"type"`
@@ -161,9 +164,6 @@ func mapToolCallUpdate(sessionID string, update json.RawMessage) []core.Event {
 		return nil
 	}
 	toolLabel := u.Title
-	if toolLabel == "" {
-		toolLabel = u.ToolCallID
-	}
 	if toolLabel == "" {
 		toolLabel = "tool"
 	}
@@ -232,7 +232,7 @@ func extractToolCallContentText(blocks []struct {
 func mapSessionUpdateFallback(sessionID string, kind string, update json.RawMessage) []core.Event {
 	// Some agents may send reasoning as a dedicated discriminator; map to EventThinking.
 	switch strings.ToLower(kind) {
-	case "reasoning", "reasoning_chunk", "thinking", "agent_thinking_chunk":
+	case "reasoning", "reasoning_chunk", "thinking", "agent_thinking_chunk", "agent_thought_chunk":
 		var u struct {
 			Content struct {
 				Type string `json:"type"`
@@ -310,7 +310,7 @@ func mapSessionUpdateFallback(sessionID string, kind string, update json.RawMess
 			}}
 		}
 	}
-	slog.Debug("acp: mapSessionUpdateFallback: unrecognized format", "kind", kind, "update", string(update))
+	slog.Debug("acp: mapSessionUpdateFallback: unrecognized format", "kind", kind, "update_bytes", len(update))
 	return nil
 }
 

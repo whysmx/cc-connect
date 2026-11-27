@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,9 +47,43 @@ const (
 )
 
 // replyContext carries the information needed to send a reply.
+//
+// chatID == "0" means the update came from a private-dialog callback, where MAX
+// omits recipient.chat_id. Always check hasChat() before using chatID as a send
+// target; when it reports false, userID is the one to address (see postMessage).
 type replyContext struct {
 	chatID    string
+	userID    string // fallback target: MAX omits recipient.chat_id in private-dialog callbacks
 	messageID string // populated from incoming message, used only by UpdateMessage
+}
+
+// hasChat reports whether chatID can be used as a send target. MAX delivers
+// callbacks from private dialogs with recipient.chat_id = 0, which the API
+// then rejects as "chat.denied: Invalid chatId: 0", so "0" counts as missing.
+func (r replyContext) hasChat() bool {
+	return r.chatID != "" && r.chatID != "0"
+}
+
+// Permission button payloads, and what each one has to become before the engine
+// can act on it: the engine matches plain words ("allow", "allow all", "deny"),
+// so forwarding the raw payload worked for perm:allow only by accident —
+// tokenisation happens to find the "allow" token — and silently did nothing for
+// perm:allow_all. label is what the card is edited to show after the press.
+const (
+	payloadAllow    = "perm:allow"
+	payloadAllowAll = "perm:allow_all"
+	payloadDeny     = "perm:deny"
+)
+
+type permDecision struct {
+	token string
+	label string
+}
+
+var permPayloads = map[string]permDecision{
+	payloadAllow:    {token: "allow", label: "✅ Allowed"},
+	payloadAllowAll: {token: "allow all", label: "✅ Allow All"},
+	payloadDeny:     {token: "deny", label: "❌ Denied"},
 }
 
 // Platform implements core.Platform for the MAX messenger bot API.
@@ -77,6 +112,20 @@ type Platform struct {
 	uploadClient *http.Client // CDN uploads — attachmentUploadTO (overrides short client Timeout)
 	dedup        core.MessageDedup
 	webServer    *http.Server
+
+	// chatOfUser remembers each user's private-dialog chat_id, learned from
+	// their incoming messages. MAX omits recipient.chat_id in callbacks, so
+	// without this a button press would open a parallel "max:0:<user>" session.
+	//
+	// Process-local by design, like dedup: it assumes a single cc-connect
+	// instance per bot token, which is also what MAX long-polling requires (two
+	// pollers on one token split updates between them). Running several
+	// instances behind a load balancer would let one learn the chat_id while
+	// another handles the callback, reviving the bug this cache exists to fix;
+	// that deployment shape needs a shared cache and is not supported today.
+	// Replies still work in that case — postMessage falls back to user_id — but
+	// the press lands in a separate session.
+	chatOfUser sync.Map // userID(string) -> chatID(string)
 }
 
 // New creates a MAX platform from config options.
@@ -223,7 +272,7 @@ func (p *Platform) Stop() error {
 		unsubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := p.unsubscribe(unsubCtx, url); err != nil {
-			slog.Warn("max: unsubscribe webhook failed", "url", url, "err", err)
+			slog.Warn("max: unsubscribe webhook failed", "url", webhookLogURL(url), "err", err)
 		}
 	}
 	return nil
@@ -247,7 +296,7 @@ func (p *Platform) startWebhook(ctx context.Context) error {
 	p.webServer = srv
 
 	go func() {
-		slog.Info("max: webhook listening", "addr", p.webhookListen, "path", p.webhookPath, "url", p.webhookURL)
+		slog.Info("max: webhook listening", "addr", p.webhookListen, "path", p.webhookPath, "url", webhookLogURL(p.webhookURL))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("max: webhook listener stopped", "err", err)
 		}
@@ -256,7 +305,7 @@ func (p *Platform) startWebhook(ctx context.Context) error {
 	if err := p.subscribe(ctx, p.webhookURL); err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	slog.Info("max: webhook subscribed", "url", p.webhookURL)
+	slog.Info("max: webhook subscribed", "url", webhookLogURL(p.webhookURL))
 
 	// MAX has been observed to silently drop the webhook subscription
 	// server-side without any delivery error. The documented 8h failure
@@ -286,6 +335,16 @@ func (p *Platform) resubscribeLoop(ctx context.Context) {
 			cancel()
 		}
 	}
+}
+
+// webhookLogURL keeps the endpoint useful for diagnostics without logging
+// query values, fragments, or userinfo that may contain credentials.
+func webhookLogURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid URL>"
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
 }
 
 // webhookCtx returns the parent context for an asynchronous webhook handler
@@ -332,7 +391,7 @@ func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	var upd maxUpdate
 	if err := json.Unmarshal(body, &upd); err != nil {
-		slog.Warn("max: webhook unmarshal", "err", err, "body", string(body[:min(len(body), 256)]))
+		slog.Warn("max: webhook unmarshal", "err", err, "body_bytes", len(body))
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -371,8 +430,7 @@ func (p *Platform) subscribe(ctx context.Context, url string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -393,8 +451,7 @@ func (p *Platform) unsubscribe(ctx context.Context, url string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -449,7 +506,7 @@ func (p *Platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAt
 			Payload: maxTokenPayload{Token: token},
 		}},
 	}
-	return p.postMessage(ctx, rctx.chatID, body)
+	return p.postMessage(ctx, rctx, body)
 }
 
 // SendFile implements core.FileSender. MAX routes images uploaded via the file
@@ -483,7 +540,7 @@ func (p *Platform) SendFile(ctx context.Context, replyCtx any, file core.FileAtt
 			Payload: maxTokenPayload{Token: token},
 		}},
 	}
-	return p.postMessage(ctx, rctx.chatID, body)
+	return p.postMessage(ctx, rctx, body)
 }
 
 // SendAudio implements core.AudioSender — uploads a voice/audio blob and sends
@@ -507,7 +564,7 @@ func (p *Platform) SendAudio(ctx context.Context, replyCtx any, audio []byte, fo
 			Payload: maxTokenPayload{Token: token},
 		}},
 	}
-	return p.postMessage(ctx, rctx.chatID, body)
+	return p.postMessage(ctx, rctx, body)
 }
 
 // UpdateMessage implements core.MessageUpdater via PUT /messages?message_id=.
@@ -541,7 +598,7 @@ func (p *Platform) UpdateMessage(ctx context.Context, replyCtx any, content stri
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("max: edit message: HTTP %d: %s", resp.StatusCode, respBody)
+		return core.HTTPError("max: edit message", resp.StatusCode, respBody, p.token, content)
 	}
 	return nil
 }
@@ -575,7 +632,7 @@ func (p *Platform) uploadAttachment(ctx context.Context, kind string, data []byt
 	defer urlResp.Body.Close()
 	if urlResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(urlResp.Body, 512))
-		return "", fmt.Errorf("upload url: HTTP %d: %s", urlResp.StatusCode, body)
+		return "", core.HTTPError("max: upload url", urlResp.StatusCode, body, p.token)
 	}
 	var urlInfo struct {
 		URL   string `json:"url"`
@@ -618,7 +675,7 @@ func (p *Platform) uploadAttachment(ctx context.Context, kind string, data []byt
 	defer cdnResp.Body.Close()
 	if cdnResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(cdnResp.Body, 512))
-		return "", fmt.Errorf("cdn upload: HTTP %d: %s", cdnResp.StatusCode, body)
+		return "", core.HTTPError("max: cdn upload", cdnResp.StatusCode, body, p.token, urlInfo.Token)
 	}
 	cdnBody, err := io.ReadAll(io.LimitReader(cdnResp.Body, 64*1024))
 	if err != nil {
@@ -685,7 +742,9 @@ func defaultFilename(kind string) string {
 // re-arm it on a ticker until the returned cancel func is called.
 func (p *Platform) StartTyping(ctx context.Context, replyCtx any) (stop func()) {
 	rctx, ok := replyCtx.(replyContext)
-	if !ok || rctx.chatID == "" {
+	// Typing needs a real chat: POST /chats/{id}/actions has no user_id form,
+	// so a callback-only context (chat_id = 0) simply skips the indicator.
+	if !ok || !rctx.hasChat() {
 		return func() {}
 	}
 	tickCtx, cancel := context.WithCancel(ctx)
@@ -730,9 +789,8 @@ func (p *Platform) sendChatAction(ctx context.Context, chatID, action string) er
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		slog.Debug("max: chat action non-2xx",
-			"chat", chatID, "action", action, "status", resp.StatusCode, "body", string(respBody))
+			"chat", chatID, "action", action, "status", resp.StatusCode)
 		return fmt.Errorf("max: chat action %s: status %d", action, resp.StatusCode)
 	}
 	return nil
@@ -760,11 +818,12 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("max: cannot reconstruct reply ctx from %q", sessionKey)
 	}
-	chatID, _, _ := strings.Cut(rest, ":")
-	if chatID == "" {
+	chatID, userID, _ := strings.Cut(rest, ":")
+	// A "max:0:<user>" key is still usable: postMessage falls back to user_id.
+	if chatID == "" || (chatID == "0" && userID == "") {
 		return nil, fmt.Errorf("max: cannot reconstruct reply ctx from %q", sessionKey)
 	}
-	return replyContext{chatID: chatID}, nil
+	return replyContext{chatID: chatID, userID: userID}, nil
 }
 
 // --- MAX API types ---
@@ -858,6 +917,22 @@ type maxUser struct {
 
 type maxRecipient struct {
 	ChatID int64 `json:"chat_id"`
+	// ChatType is "dialog" for a private dialog and "chat"/"channel" for a
+	// group or channel. MAX sends callbacks from private dialogs without a
+	// usable chat_id, so only a dialog chat_id may be cached for them.
+	ChatType string `json:"chat_type"`
+}
+
+// isGroupChatType reports whether a MAX recipient chat_type names a group or
+// channel rather than a private dialog. MAX uses "dialog" for DMs and
+// "chat"/"channel" for shared chats; an unknown or empty value is treated as a
+// dialog so payloads without the field keep the callback fallback working.
+func isGroupChatType(chatType string) bool {
+	switch strings.ToLower(strings.TrimSpace(chatType)) {
+	case "chat", "group", "channel":
+		return true
+	}
+	return false
 }
 
 type maxCallback struct {
@@ -940,7 +1015,7 @@ func (p *Platform) poll(ctx context.Context, marker *int64) (*int64, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("poll: HTTP %d: %s", resp.StatusCode, body)
+		return nil, core.HTTPError("max: poll", resp.StatusCode, body, p.token)
 	}
 
 	var result maxUpdatesResponse
@@ -1008,8 +1083,16 @@ func (p *Platform) handleMessage(ctx context.Context, msg *maxMessage) {
 	}
 
 	chatID := strconv.FormatInt(msg.Recipient.ChatID, 10)
+	// Remember the private dialog so callbacks (which arrive without
+	// recipient.chat_id) can be routed to the same session instead of spawning
+	// "max:0:<user>". Group and channel chats must not be cached: a group post
+	// would overwrite the dialog chat_id and a later button press in the DM
+	// would be answered in the group session instead.
+	if chatID != "0" && chatID != "" && !isGroupChatType(msg.Recipient.ChatType) {
+		p.chatOfUser.Store(userID, chatID)
+	}
 	sessionKey := fmt.Sprintf("max:%s:%s", chatID, userID)
-	rctx := replyContext{chatID: chatID, messageID: msg.Body.Mid}
+	rctx := replyContext{chatID: chatID, userID: userID, messageID: msg.Body.Mid}
 
 	// Acknowledge the message so the user gets a "read" tick in MAX.
 	// Fire-and-forget — must never block the routing flow.
@@ -1251,7 +1334,7 @@ func (p *Platform) resolveMediaURL(ctx context.Context, kind, token string) (str
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		return "", "", core.HTTPError("max: attachment info", resp.StatusCode, body, p.token, token)
 	}
 	var info struct {
 		URL   string `json:"url"`
@@ -1300,24 +1383,64 @@ func (p *Platform) handleCallback(ctx context.Context, cb *maxCallback) {
 		return
 	}
 
+	// MAX does not fill recipient.chat_id for callbacks from private dialogs,
+	// so fall back to the chat_id learned from this user's earlier messages.
+	// Without it the press lands in a separate "max:0:<user>" session and the
+	// reply is POSTed to chat_id=0, which MAX rejects with chat.denied.
 	chatID := strconv.FormatInt(cb.Message.Recipient.ChatID, 10)
+	if chatID == "0" || chatID == "" {
+		if known, ok := p.chatOfUser.Load(userID); ok {
+			chatID, _ = known.(string)
+		}
+	}
 	sessionKey := fmt.Sprintf("max:%s:%s", chatID, userID)
-	rctx := replyContext{chatID: chatID, messageID: cb.Message.Body.Mid}
+	rctx := replyContext{chatID: chatID, userID: userID, messageID: cb.Message.Body.Mid}
 
-	slog.Debug("max: callback received", "user", cb.User.Name, "payload", cb.Payload)
+	slog.Debug("max: callback received", "user", cb.User.Name, "payload_len", len(cb.Payload))
+
+	// Translate permission payloads like the Telegram platform does, and flag the
+	// message so a stale click is dropped instead of reaching the agent as user
+	// input. Any other payload (ordinary buttons) passes through untouched.
+	content := cb.Payload
+	isPerm := false
+	choice := ""
+	if d, ok := permPayloads[cb.Payload]; ok {
+		content, choice, isPerm = d.token, d.label, true
+	}
 
 	handler := p.getHandler()
 	if handler == nil {
 		return
 	}
+
+	// Best-effort: mark the original card so the user sees which button won and
+	// cannot press it twice. Failure here must not block the decision itself.
+	if choice != "" && rctx.messageID != "" {
+		origText := cb.Message.Body.Text
+		if origText == "" {
+			origText = "(permission request)"
+		}
+		if err := p.UpdateMessage(ctx, rctx, origText+"\n\n"+choice); err != nil {
+			// 403/404 means the chat is gone — the user left between the message
+			// and the press. That is worth noticing; a transient blip is not.
+			if e := err.Error(); strings.Contains(e, "403") || strings.Contains(e, "404") {
+				slog.Warn("max: permission callback edit failed (chat no longer accessible)",
+					"error", err, "user", cb.User.Name)
+			} else {
+				slog.Debug("max: permission callback edit failed", "error", err)
+			}
+		}
+	}
+
 	handler(p, &core.Message{
-		SessionKey: sessionKey,
-		Platform:   "max",
-		MessageID:  cb.CallbackID,
-		UserID:     userID,
-		UserName:   cb.User.Name,
-		Content:    cb.Payload,
-		ReplyCtx:   rctx,
+		SessionKey:           sessionKey,
+		Platform:             "max",
+		MessageID:            cb.CallbackID,
+		UserID:               userID,
+		UserName:             cb.User.Name,
+		Content:              content,
+		ReplyCtx:             rctx,
+		IsPermissionResponse: isPerm,
 	})
 }
 
@@ -1382,7 +1505,7 @@ func (p *Platform) sendText(ctx context.Context, replyCtx any, content string, b
 		if i == len(chunks)-1 && len(kbAttachments) > 0 {
 			chunkBody.Attachments = kbAttachments
 		}
-		if err := p.postMessage(ctx, rctx.chatID, &chunkBody); err != nil {
+		if err := p.postMessage(ctx, rctx, &chunkBody); err != nil {
 			return err
 		}
 		if len(chunks) > 1 && i < len(chunks)-1 {
@@ -1395,10 +1518,20 @@ func (p *Platform) sendText(ctx context.Context, replyCtx any, content string, b
 // postMessage sends one /messages request. It is the single HTTP call used by
 // sendText, SendImage, SendFile — kept separate so retry/backoff for
 // "attachment.not.ready" lives in one place.
-func (p *Platform) postMessage(ctx context.Context, chatID string, body *maxSendBody) error {
+func (p *Platform) postMessage(ctx context.Context, rctx replyContext, body *maxSendBody) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
+	}
+	// Target selection: chat_id when MAX gave us one, user_id otherwise.
+	// Private-dialog callbacks arrive with recipient.chat_id = 0 (see hasChat),
+	// and POST /messages?user_id= is the documented way to reach a user directly.
+	target, targetValue := "chat_id", rctx.chatID
+	if !rctx.hasChat() {
+		if rctx.userID == "" {
+			return fmt.Errorf("max: send message: reply context has neither chat_id nor user_id")
+		}
+		target, targetValue = "user_id", rctx.userID
 	}
 	backoff := attachmentReadyDelay
 	for attempt := 0; attempt <= attachmentReadyRetries; attempt++ {
@@ -1408,7 +1541,7 @@ func (p *Platform) postMessage(ctx context.Context, chatID string, body *maxSend
 		}
 		p.setAuth(req)
 		q := req.URL.Query()
-		q.Set("chat_id", chatID)
+		q.Set(target, targetValue)
 		req.URL.RawQuery = q.Encode()
 		req.Header.Set("Content-Type", "application/json")
 
@@ -1432,8 +1565,9 @@ func (p *Platform) postMessage(ctx context.Context, chatID string, body *maxSend
 			backoff *= 2
 			continue
 		}
-		slog.Warn("max: send message failed", "status", resp.StatusCode, "chat", chatID, "body", string(respBody))
-		return fmt.Errorf("max: send message: HTTP %d: %s", resp.StatusCode, respBody)
+		failure := core.HTTPError("max: send message", resp.StatusCode, respBody, p.token, body.Text)
+		slog.Warn("max: send message failed", "error", failure, target, targetValue)
+		return failure
 	}
 	return fmt.Errorf("max: send message: attachment not ready after %d retries", attachmentReadyRetries)
 }
@@ -1546,13 +1680,13 @@ func splitMessage(text string, maxLen int) []string {
 
 // Compile-time interface compliance assertions.
 var (
-	_ core.Platform                    = (*Platform)(nil)
-	_ core.ImageSender                 = (*Platform)(nil)
-	_ core.FileSender                  = (*Platform)(nil)
-	_ core.AudioSender                 = (*Platform)(nil)
-	_ core.InlineButtonSender          = (*Platform)(nil)
-	_ core.MessageUpdater              = (*Platform)(nil)
-	_ core.TypingIndicator             = (*Platform)(nil)
+	_ core.Platform                      = (*Platform)(nil)
+	_ core.ImageSender                   = (*Platform)(nil)
+	_ core.FileSender                    = (*Platform)(nil)
+	_ core.AudioSender                   = (*Platform)(nil)
+	_ core.InlineButtonSender            = (*Platform)(nil)
+	_ core.MessageUpdater                = (*Platform)(nil)
+	_ core.TypingIndicator               = (*Platform)(nil)
 	_ core.FormattingInstructionProvider = (*Platform)(nil)
-	_ core.ReplyContextReconstructor   = (*Platform)(nil)
+	_ core.ReplyContextReconstructor     = (*Platform)(nil)
 )

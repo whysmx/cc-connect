@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -141,6 +143,74 @@ func TestHandleResultCompactionSubtypeIsNotTerminal(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatal("timeout waiting for EventResult")
+			}
+		})
+	}
+}
+
+// TestHandleResultDropsEmptyTaskNotificationResult reproduces the event
+// order Claude Code emits when a session is resumed after the previous
+// process exited with a background shell task still running: a synthetic
+// empty result for the orphaned task notification (origin.kind ==
+// "task-notification", num_turns == 0) arrives before the result of the
+// prompt cc-connect sent. Only the real result may reach the engine;
+// otherwise the user's turn ends with "(empty response)".
+func TestHandleResultDropsEmptyTaskNotificationResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{
+		events: make(chan core.Event, 8),
+		ctx:    ctx,
+	}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	// Shapes captured from Claude Code 2.1.280 stream-json output.
+	cs.handleReadLoopLine(`{"type":"system","subtype":"task_notification","task_id":"b6l8ybd50","status":"stopped","summary":"Background shell command didn't finish before the previous session ended","session_id":"test-session"}`)
+	cs.handleReadLoopLine(`{"type":"result","subtype":"success","is_error":false,"duration_api_ms":0,"num_turns":0,"result":"","stop_reason":null,"session_id":"test-session","usage":{"input_tokens":0,"output_tokens":0},"origin":{"kind":"task-notification"}}`)
+	cs.handleReadLoopLine(`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"PONG-42"}]},"session_id":"test-session"}`)
+	cs.handleReadLoopLine(`{"type":"result","subtype":"success","is_error":false,"duration_api_ms":6611,"num_turns":1,"result":"PONG-42","session_id":"test-session","usage":{"input_tokens":10,"output_tokens":46}}`)
+
+	var results []core.Event
+	for {
+		select {
+		case evt := <-cs.events:
+			if evt.Type == core.EventResult {
+				results = append(results, evt)
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d EventResult, want 1 (stray task-notification result must be dropped): %#v", len(results), results)
+	}
+	if results[0].Content != "PONG-42" || !results[0].Done {
+		t.Fatalf("result = %#v, want Done result with content PONG-42", results[0])
+	}
+}
+
+func TestIsEmptyTaskNotificationResult(t *testing.T) {
+	notif := map[string]any{"kind": "task-notification"}
+	cases := []struct {
+		name    string
+		raw     map[string]any
+		content string
+		want    bool
+	}{
+		{"orphan notification", map[string]any{"origin": notif, "num_turns": float64(0)}, "", true},
+		{"notification answered by model", map[string]any{"origin": notif, "num_turns": float64(1)}, "", false},
+		{"notification with text", map[string]any{"origin": notif, "num_turns": float64(0)}, "done", false},
+		{"no origin (local slash command)", map[string]any{"num_turns": float64(0)}, "", false},
+		{"other origin", map[string]any{"origin": map[string]any{"kind": "user"}, "num_turns": float64(0)}, "", false},
+		{"missing num_turns", map[string]any{"origin": notif}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isEmptyTaskNotificationResult(tc.raw, tc.content); got != tc.want {
+				t.Errorf("isEmptyTaskNotificationResult = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -853,6 +923,71 @@ func TestHandleUserEmitsToolResult(t *testing.T) {
 	}
 }
 
+func TestHandleUserToolResultPreservesUTF8AtTruncation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: ctx, toolResultMaxLen: 500}
+	cs.alive.Store(true)
+	// A 500-byte cut lands inside the three-byte character.
+	result := strings.Repeat("a", 499) + "中" + "tail"
+	cs.handleUser(map[string]any{
+		"message": map[string]any{
+			"content": []any{map[string]any{
+				"type": "tool_result", "content": result,
+			}},
+		},
+	})
+
+	select {
+	case event := <-cs.events:
+		if event.Type != core.EventToolResult {
+			t.Fatalf("event type = %q, want %q", event.Type, core.EventToolResult)
+		}
+		if !utf8.ValidString(event.ToolResult) {
+			t.Fatalf("tool result is not valid UTF-8: %q", event.ToolResult)
+		}
+		if len(event.ToolResult) > 500 || !strings.HasPrefix(event.ToolResult, strings.Repeat("a", 400)) || !strings.Contains(event.ToolResult, "truncated") {
+			t.Fatalf("tool result = %q, want UTF-8 prefix and notice within 500 bytes", event.ToolResult)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for tool result")
+	}
+}
+
+func TestHandleUserToolResultUsesReadableDefaultBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: ctx}
+	cs.alive.Store(true)
+	result := strings.Repeat("中文😀", 1200)
+	cs.handleUser(map[string]any{"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "content": result}}}})
+	select {
+	case event := <-cs.events:
+		if !utf8.ValidString(event.ToolResult) || len(event.ToolResult) > 4000 || len(event.ToolResult) < 3000 {
+			t.Fatalf("tool result length=%d valid=%v, want readable UTF-8 within 4000 bytes", len(event.ToolResult), utf8.ValidString(event.ToolResult))
+		}
+		if !strings.Contains(event.ToolResult, "truncated") || !strings.HasPrefix(event.ToolResult, "中文😀") {
+			t.Fatalf("tool result lost content or truncation notice: %q", event.ToolResult)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for tool result")
+	}
+}
+
+func TestHandleUserToolResultHonorsConfiguredBudget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &claudeSession{events: make(chan core.Event, 1), ctx: ctx, toolResultMaxLen: 800}
+	cs.alive.Store(true)
+	result := strings.Repeat("中文😀", 1200)
+	cs.handleUser(map[string]any{"message": map[string]any{"content": []any{map[string]any{"type": "tool_result", "content": result}}}})
+	event := <-cs.events
+	if !utf8.ValidString(event.ToolResult) || len(event.ToolResult) > 800 || len(event.ToolResult) < 700 || !strings.Contains(event.ToolResult, "truncated") {
+		t.Fatalf("configured result length=%d valid=%v text=%q", len(event.ToolResult), utf8.ValidString(event.ToolResult), event.ToolResult)
+	}
+}
+
 func helperCommand(ctx context.Context, mode string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", mode)
 	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
@@ -944,13 +1079,44 @@ func TestHelperProcess(t *testing.T) {
 			// JSON quoting.
 			turnText := line
 			var envelope struct {
-				Type    string `json:"type"`
-				Message struct {
+				Type      string `json:"type"`
+				RequestID string `json:"request_id"`
+				Message   struct {
 					Role    string `json:"role"`
 					Content any    `json:"content"`
 				} `json:"message"`
 			}
-			if err := json.Unmarshal([]byte(line), &envelope); err == nil && envelope.Type == "user" {
+			_ = json.Unmarshal([]byte(line), &envelope)
+			if envelope.Type == "control_request" {
+				mode := os.Getenv("CC_CONNECT_TEST_SETTINGS_MODE")
+				if mode == "ignore" {
+					continue
+				}
+				subtype := "success"
+				if mode == "error" {
+					subtype = "error"
+				}
+				resp, _ := json.Marshal(map[string]any{
+					"type": "control_response",
+					"response": map[string]any{
+						"subtype":    subtype,
+						"request_id": envelope.RequestID,
+						"error":      "test-credential-must-not-leak",
+						"response": map[string]any{
+							"applied": map[string]any{"effort": "xhigh"},
+						},
+					},
+				})
+				if mode == "malformed" {
+					resp = []byte("incomplete settings response")
+				}
+				if mode == "renamed" {
+					resp = bytes.Replace(resp, []byte("control_response"), []byte("settings_response"), 1)
+				}
+				_, _ = os.Stdout.Write(append(resp, '\n'))
+				continue
+			}
+			if envelope.Type == "user" {
 				switch c := envelope.Message.Content.(type) {
 				case string:
 					turnText = c
@@ -982,6 +1148,39 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(0)
 	default:
 		os.Exit(2)
+	}
+}
+
+func TestRouterSessionKeepsVerboseForStreamJSON(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs, err := newClaudeSession(ctx, t.TempDir(), os.Args[0],
+		[]string{"-test.run=TestHelperProcess", "--", "sleep"}, "", "", "", "", "default", "", "", nil, nil, nil,
+		[]string{"GO_WANT_HELPER_PROCESS=1", "ANTHROPIC_BASE_URL=http://127.0.0.1:3456"}, "",
+		core.SpawnOptions{}, 0, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	if !slices.Contains(cs.cmd.Args, "--verbose") {
+		t.Fatalf("router session omitted --verbose: %v", cs.cmd.Args)
+	}
+}
+
+func TestReadLoopSkipsVerboseTextBeforeJSON(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cs := &claudeSession{events: make(chan core.Event, 2), ctx: ctx}
+	cs.alive.Store(true)
+	cs.handleReadLoopLine("verbose: connecting to router")
+	cs.handleReadLoopLine(`{"type":"result","subtype":"success","num_turns":1,"result":"router reply","session_id":"router-session"}`)
+	select {
+	case event := <-cs.events:
+		if event.Type != core.EventResult || event.Content != "router reply" {
+			t.Fatalf("event after verbose text = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("JSON result was lost after verbose text")
 	}
 }
 
@@ -1056,7 +1255,6 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 		nil,                                  // pluginDirs
 		[]string{"GO_WANT_HELPER_PROCESS=1"}, // extraEnv: route child into helper branch
 		"",                                   // platformPrompt
-		false,                                // disableVerbose
 		spawnOpts,
 		0,  // maxContextTokens
 		0,  // ctxWindowTokens
@@ -1134,6 +1332,11 @@ func TestNewClaudeSession_NoReplayFlagKeepsProcessAlive(t *testing.T) {
 	// Close() will send stdin EOF and the helper will exit cleanly.
 	if !cs.Alive() {
 		t.Fatal("helper died before Close() — keep-alive contract violated")
+	}
+	// The helper answered the startup get_settings request before echoing
+	// any turn, so the applied effort is known by now.
+	if got := cs.GetReasoningEffort(); got != "xhigh" {
+		t.Fatalf("GetReasoningEffort() = %q, want applied effort %q", got, "xhigh")
 	}
 }
 
